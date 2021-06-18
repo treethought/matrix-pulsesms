@@ -45,8 +45,8 @@ build arm:
 
 build docker amd64:
   <<: *build-docker
-  tags:
-    - amd64
+  # tags:
+  #   - amd64
   dependencies:
     - build amd64
   needs:
@@ -61,16 +61,16 @@ build docker amd64:
   #       curl "$NOVA_ADMIN_API_URL" -H "Content-Type: application/json" -d '{"password":"'"$NOVA_ADMIN_NIGHTLY_PASS"'","bridge":"'$NOVA_BRIDGE_TYPE'","image":"'$CI_REGISTRY_IMAGE':'$CI_COMMIT_SHA'-amd64"}'
   #     fi
 
-build docker arm64:
-  <<: *build-docker
-  tags:
-    - arm64
-  dependencies:
-    - build arm64
-  needs:
-    - build arm64
-  variables:
-    DOCKER_ARCH: arm64
+# build docker arm64:
+#   <<: *build-docker
+#   tags:
+#     - arm64
+#   dependencies:
+#     - build arm64
+#   needs:
+#     - build arm64
+#   variables:
+#     DOCKER_ARCH: arm64
 
 manifest:
   stage: manifest
@@ -81,7 +81,6 @@ manifest:
     - docker login -u $CI_REGISTRY_USER -p $CI_REGISTRY_PASSWORD $CI_REGISTRY
   needs:
     - build docker amd64
-    - build docker arm64
   script:
     - docker pull $CI_REGISTRY_IMAGE:$CI_COMMIT_SHA-amd64
     - docker pull $CI_REGISTRY_IMAGE:$CI_COMMIT_SHA-arm64
