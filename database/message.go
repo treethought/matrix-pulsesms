@@ -1,4 +1,4 @@
-// mautrix-whatsapp - A Matrix-WhatsApp puppeting bridge.
+// mautrix-pulsesms - A Matrix-WhatsApp puppeting bridge.
 // Copyright (C) 2020 Tulir Asokan
 //
 // This program is free software: you can redistribute it and/or modify
@@ -23,8 +23,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/Rhymen/go-whatsapp"
-	waProto "github.com/Rhymen/go-whatsapp/binary/proto"
+	"github.com/treethought/pulsesms"
 
 	log "maunium.net/go/maulogger/v2"
 
@@ -44,7 +43,7 @@ func (mq *MessageQuery) New() *Message {
 }
 
 func (mq *MessageQuery) GetAll(chat PortalKey) (messages []*Message) {
-	rows, err := mq.db.Query("SELECT chat_jid, chat_receiver, jid, mxid, sender, timestamp, sent, content FROM message WHERE chat_jid=$1 AND chat_receiver=$2", chat.JID, chat.Receiver)
+	rows, err := mq.db.Query("SELECT chat_pid, chat_receiver, pid, mxid, sender, timestamp, sent, content FROM message WHERE chat_pid=$1 AND chat_receiver=$2", chat.PID, chat.Receiver)
 	if err != nil || rows == nil {
 		return nil
 	}
@@ -55,24 +54,27 @@ func (mq *MessageQuery) GetAll(chat PortalKey) (messages []*Message) {
 	return
 }
 
-func (mq *MessageQuery) GetByJID(chat PortalKey, jid whatsapp.MessageID) *Message {
-	return mq.get("SELECT chat_jid, chat_receiver, jid, mxid, sender, timestamp, sent, content "+
-		"FROM message WHERE chat_jid=$1 AND chat_receiver=$2 AND jid=$3", chat.JID, chat.Receiver, jid)
+// TODO accept pulsesms.MessageID (int)
+func (mq *MessageQuery) GetByPID(chat PortalKey, pid string) *Message {
+	return mq.get("SELECT chat_pid, chat_receiver, pid, mxid, sender, timestamp, sent, content "+
+		"FROM message WHERE chat_pid=$1 AND chat_receiver=$2 AND pid=$3", chat.PID, chat.Receiver, pid)
 }
 
 func (mq *MessageQuery) GetByMXID(mxid id.EventID) *Message {
-	return mq.get("SELECT chat_jid, chat_receiver, jid, mxid, sender, timestamp, sent, content "+
+	return mq.get("SELECT chat_pid, chat_receiver, pid, mxid, sender, timestamp, sent, content "+
 		"FROM message WHERE mxid=$1", mxid)
 }
 
 func (mq *MessageQuery) GetLastInChat(chat PortalKey) *Message {
-	return mq.GetLastInChatBefore(chat, time.Now().Unix()+60)
+	// timestamps in ms, not seconds
+	now := time.Now().UTC().UnixNano() / 1e6
+	return mq.GetLastInChatBefore(chat, now+6000)
 }
 
 func (mq *MessageQuery) GetLastInChatBefore(chat PortalKey, maxTimestamp int64) *Message {
-	msg := mq.get("SELECT chat_jid, chat_receiver, jid, mxid, sender, timestamp, sent, content "+
-		"FROM message WHERE chat_jid=$1 AND chat_receiver=$2 AND timestamp<=$3 AND sent=true ORDER BY timestamp DESC LIMIT 1",
-		chat.JID, chat.Receiver, maxTimestamp)
+	msg := mq.get("SELECT chat_pid, chat_receiver, pid, mxid, sender, timestamp, sent, content "+
+		"FROM message WHERE chat_pid=$1 AND chat_receiver=$2 AND timestamp<=$3 AND sent=true ORDER BY timestamp DESC LIMIT 1",
+		chat.PID, chat.Receiver, maxTimestamp)
 	if msg == nil || msg.Timestamp == 0 {
 		// Old db, we don't know what the last message is.
 		return nil
@@ -93,21 +95,21 @@ type Message struct {
 	log log.Logger
 
 	Chat      PortalKey
-	JID       whatsapp.MessageID
+	PID       pulsesms.MessageID // TODO: change to string?
 	MXID      id.EventID
-	Sender    whatsapp.JID
+	Sender    pulsesms.PhoneNumber
 	Timestamp int64
 	Sent      bool
-	Content   *waProto.Message
+	Content   string // TODO: richer type? compare to wa.ProtoMessage
 }
 
 func (msg *Message) IsFakeMXID() bool {
-	return strings.HasPrefix(msg.MXID.String(), "net.maunium.whatsapp.fake::")
+	return strings.HasPrefix(msg.MXID.String(), "dev.spherics.pulsesms.fake::")
 }
 
 func (msg *Message) Scan(row Scannable) *Message {
 	var content []byte
-	err := row.Scan(&msg.Chat.JID, &msg.Chat.Receiver, &msg.JID, &msg.MXID, &msg.Sender, &msg.Timestamp, &msg.Sent, &content)
+	err := row.Scan(&msg.Chat.PID, &msg.Chat.Receiver, &msg.PID, &msg.MXID, &msg.Sender, &msg.Timestamp, &msg.Sent, &content)
 	if err != nil {
 		if err != sql.ErrNoRows {
 			msg.log.Errorln("Database scan failed:", err)
@@ -115,19 +117,21 @@ func (msg *Message) Scan(row Scannable) *Message {
 		return nil
 	}
 
+	// decrypt?
 	msg.decodeBinaryContent(content)
 
 	return msg
 }
 
 func (msg *Message) decodeBinaryContent(content []byte) {
-	msg.Content = &waProto.Message{}
-	reader := bytes.NewReader(content)
-	dec := json.NewDecoder(reader)
-	err := dec.Decode(msg.Content)
-	if err != nil {
-		msg.log.Warnln("Failed to decode message content:", err)
-	}
+	return
+	// msg.Content = &waProto.Message{}
+	// reader := bytes.NewReader(content)
+	// dec := json.NewDecoder(reader)
+	// err := dec.Decode(msg.Content)
+	// if err != nil {
+	// 	msg.log.Warnln("Failed to decode message content:", err)
+	// }
 }
 
 func (msg *Message) encodeBinaryContent() []byte {
@@ -142,25 +146,25 @@ func (msg *Message) encodeBinaryContent() []byte {
 
 func (msg *Message) Insert() {
 	_, err := msg.db.Exec(`INSERT INTO message
-			(chat_jid, chat_receiver, jid, mxid, sender, timestamp, sent, content)
+			(chat_pid, chat_receiver, pid, mxid, sender, timestamp, sent, content)
 			VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
-		msg.Chat.JID, msg.Chat.Receiver, msg.JID, msg.MXID, msg.Sender, msg.Timestamp, msg.Sent, msg.encodeBinaryContent())
+		msg.Chat.PID, msg.Chat.Receiver, msg.PID, msg.MXID, msg.Sender, msg.Timestamp, msg.Sent, msg.encodeBinaryContent())
 	if err != nil {
-		msg.log.Warnfln("Failed to insert %s@%s: %v", msg.Chat, msg.JID, err)
+		msg.log.Warnfln("Failed to insert %s@%s: %v", msg.Chat, msg.PID, err)
 	}
 }
 
 func (msg *Message) MarkSent() {
 	msg.Sent = true
-	_, err := msg.db.Exec("UPDATE message SET sent=true WHERE chat_jid=$1 AND chat_receiver=$2 AND jid=$3", msg.Chat.JID, msg.Chat.Receiver, msg.JID)
+	_, err := msg.db.Exec("UPDATE message SET sent=true WHERE chat_pid=$1 AND chat_receiver=$2 AND pid=$3", msg.Chat.PID, msg.Chat.Receiver, msg.PID)
 	if err != nil {
-		msg.log.Warnfln("Failed to update %s@%s: %v", msg.Chat, msg.JID, err)
+		msg.log.Warnfln("Failed to update %s@%s: %v", msg.Chat, msg.PID, err)
 	}
 }
 
 func (msg *Message) Delete() {
-	_, err := msg.db.Exec("DELETE FROM message WHERE chat_jid=$1 AND chat_receiver=$2 AND jid=$3", msg.Chat.JID, msg.Chat.Receiver, msg.JID)
+	_, err := msg.db.Exec("DELETE FROM message WHERE chat_pid=$1 AND chat_receiver=$2 AND pid=$3", msg.Chat.PID, msg.Chat.Receiver, msg.PID)
 	if err != nil {
-		msg.log.Warnfln("Failed to delete %s@%s: %v", msg.Chat, msg.JID, err)
+		msg.log.Warnfln("Failed to delete %s@%s: %v", msg.Chat, msg.PID, err)
 	}
 }

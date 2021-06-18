@@ -22,7 +22,7 @@ appservice:
         # The database URI.
         #   SQLite: File name is enough. https://github.com/mattn/go-sqlite3#connection-string
         #   Postgres: Connection string. For example, postgres://user:password@host/database?sslmode=disable
-        uri: mautrix-whatsapp.db
+        uri: matrix-pulsesms.db
         # Maximum number of connections. Mostly relevant for Postgres.
         max_open_conns: 20
         max_idle_conns: 2
@@ -57,7 +57,7 @@ metrics:
 
 whatsapp:
     # Device name that's shown in the "WhatsApp Web" section in the mobile app.
-    os_name: Mautrix-WhatsApp bridge
+    os_name: matrix-Pulsesms bridge
     # Browser name that determines the logo shown in the mobile app. If the name is unrecognized, a generic icon is shown.
     # Use the name of an actual browser (Chrome, Firefox, Safari, IE, Edge, Opera) if you want a specific icon.
     browser_name: mx-wa

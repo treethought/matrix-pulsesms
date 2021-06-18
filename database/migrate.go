@@ -96,7 +96,7 @@ func Migrate(old *Database, new *Database) {
 	if err != nil {
 		panic(err)
 	}
-	err = migrateTable(old, new, "user", "mxid", "jid", "management_room", "client_id", "client_token", "server_token", "enc_key", "mac_key", "last_connection")
+	err = migrateTable(old, new, "user", "mxid", "jid", "management_room", "account_id", "password_hash", "salt", "enc_key", "mac_key", "last_connection")
 	if err != nil {
 		panic(err)
 	}

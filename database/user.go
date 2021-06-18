@@ -1,4 +1,4 @@
-// mautrix-whatsapp - A Matrix-WhatsApp puppeting bridge.
+// mautrix-pulsesms - A Matrix-WhatsApp puppeting bridge.
 // Copyright (C) 2020 Tulir Asokan
 //
 // This program is free software: you can redistribute it and/or modify
@@ -22,7 +22,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/Rhymen/go-whatsapp"
+	"github.com/treethought/pulsesms"
 
 	log "maunium.net/go/maulogger/v2"
 
@@ -42,7 +42,7 @@ func (uq *UserQuery) New() *User {
 }
 
 func (uq *UserQuery) GetAll() (users []*User) {
-	rows, err := uq.db.Query(`SELECT mxid, jid, management_room, last_connection, client_id, client_token, server_token, enc_key, mac_key FROM "user"`)
+	rows, err := uq.db.Query(`SELECT mxid, pid, management_room, last_connection, account_id, password_hash, salt FROM "user"`)
 	if err != nil || rows == nil {
 		return nil
 	}
@@ -54,15 +54,16 @@ func (uq *UserQuery) GetAll() (users []*User) {
 }
 
 func (uq *UserQuery) GetByMXID(userID id.UserID) *User {
-	row := uq.db.QueryRow(`SELECT mxid, jid, management_room, last_connection, client_id, client_token, server_token, enc_key, mac_key FROM "user" WHERE mxid=$1`, userID)
+	row := uq.db.QueryRow(`SELECT mxid, pid, management_room, last_connection, account_id, password_hash, salt FROM "user" WHERE mxid=$1`, userID)
 	if row == nil {
 		return nil
 	}
 	return uq.New().Scan(row)
 }
 
-func (uq *UserQuery) GetByJID(userID whatsapp.JID) *User {
-	row := uq.db.QueryRow(`SELECT mxid, jid, management_room, last_connection, client_id, client_token, server_token, enc_key, mac_key FROM "user" WHERE jid=$1`, stripSuffix(userID))
+func (uq *UserQuery) GetByPID(userID pulsesms.PhoneNumber) *User {
+	uq.log.Warnfln("getting db user by pid %s", userID)
+	row := uq.db.QueryRow(`SELECT mxid, pid, management_room, last_connection, account_id, password_hash, salt FROM "user" WHERE pid=$1`, (userID))
 	if row == nil {
 		return nil
 	}
@@ -70,64 +71,69 @@ func (uq *UserQuery) GetByJID(userID whatsapp.JID) *User {
 }
 
 type User struct {
-	db  *Database
-	log log.Logger
-
+	db             *Database
+	log            log.Logger
 	MXID           id.UserID
-	JID            whatsapp.JID
+	PID            pulsesms.PhoneNumber
 	ManagementRoom id.RoomID
-	Session        *whatsapp.Session
+	Session        *pulsesms.KeyCredentials
 	LastConnection int64
+	AccountID      pulsesms.AccountID
 }
 
 func (user *User) Scan(row Scannable) *User {
-	var jid, clientID, clientToken, serverToken sql.NullString
-	var encKey, macKey []byte
-	err := row.Scan(&user.MXID, &jid, &user.ManagementRoom, &user.LastConnection, &clientID, &clientToken, &serverToken, &encKey, &macKey)
+	var pid, accountID, pwHash, salt sql.NullString
+	// var encKey, macKey []byte
+	// err := row.Scan(&user.MXID, &pid, &user.ManagementRoom, &user.LastConnection, &accountID, &pwHash, &salt, &encKey, &macKey)
+	err := row.Scan(&user.MXID, &pid, &user.ManagementRoom, &user.LastConnection, &accountID, &pwHash, &salt)
 	if err != nil {
 		if err != sql.ErrNoRows {
 			user.log.Errorln("Database scan failed:", err)
 		}
 		return nil
 	}
-	if len(jid.String) > 0 && len(clientID.String) > 0 {
-		user.JID = jid.String + whatsapp.NewUserSuffix
-		user.Session = &whatsapp.Session{
-			ClientID:    clientID.String,
-			ClientToken: clientToken.String,
-			ServerToken: serverToken.String,
-			EncKey:      encKey,
-			MacKey:      macKey,
-			Wid:         jid.String + whatsapp.OldUserSuffix,
+	if len(accountID.String) > 0 {
+		user.Session = &pulsesms.KeyCredentials{
+			AccountID:    pulsesms.AccountID(accountID.String),
+			PasswordHash: pwHash.String,
+			Salt:         salt.String,
 		}
+
 	} else {
 		user.Session = nil
+	}
+
+	if len(pid.String) > 0 {
+		user.PID = pid.String
 	}
 	return user
 }
 
-func stripSuffix(jid whatsapp.JID) string {
-	if len(jid) == 0 {
-		return jid
-	}
+// func stripSuffix(pid pulsesms.ConversationID) string {
+// 	if len(pid) == 0 {
+// 		return pid
+// 	}
 
-	index := strings.IndexRune(jid, '@')
-	if index < 0 {
-		return jid
-	}
+// 	index := strings.IndexRune(pid, '@')
+// 	if index < 0 {
+// 		return pid
+// 	}
 
-	return jid[:index]
+// 	return pid[:index]
+// }
+
+func (user *User) pidPtr() *string {
+	str := fmt.Sprint(user.PID)
+	return &str
+	// return string(user.PID)
+	// if user.PID != 0 {
+	// str := stripSuffix(user.PID)
+	// return &str
+	// }
+	// return nil
 }
 
-func (user *User) jidPtr() *string {
-	if len(user.JID) > 0 {
-		str := stripSuffix(user.JID)
-		return &str
-	}
-	return nil
-}
-
-func (user *User) sessionUnptr() (sess whatsapp.Session) {
+func (user *User) sessionUnptr() (sess pulsesms.KeyCredentials) {
 	if user.Session != nil {
 		sess = *user.Session
 	}
@@ -136,10 +142,10 @@ func (user *User) sessionUnptr() (sess whatsapp.Session) {
 
 func (user *User) Insert() {
 	sess := user.sessionUnptr()
-	_, err := user.db.Exec(`INSERT INTO "user" (mxid, jid, management_room, last_connection, client_id, client_token, server_token, enc_key, mac_key) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
-		user.MXID, user.jidPtr(),
+	_, err := user.db.Exec(`INSERT INTO "user" (mxid, pid, management_room, last_connection, account_id, password_hash, salt) VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+		user.MXID, user.pidPtr(),
 		user.ManagementRoom, user.LastConnection,
-		sess.ClientID, sess.ClientToken, sess.ServerToken, sess.EncKey, sess.MacKey)
+		sess.AccountID, sess.PasswordHash, sess.Salt)
 	if err != nil {
 		user.log.Warnfln("Failed to insert %s: %v", user.MXID, err)
 	}
@@ -156,9 +162,9 @@ func (user *User) UpdateLastConnection() {
 
 func (user *User) Update() {
 	sess := user.sessionUnptr()
-	_, err := user.db.Exec(`UPDATE "user" SET jid=$1, management_room=$2, last_connection=$3, client_id=$4, client_token=$5, server_token=$6, enc_key=$7, mac_key=$8 WHERE mxid=$9`,
-		user.jidPtr(), user.ManagementRoom, user.LastConnection,
-		sess.ClientID, sess.ClientToken, sess.ServerToken, sess.EncKey, sess.MacKey,
+	_, err := user.db.Exec(`UPDATE "user" SET pid=$1, management_room=$2, last_connection=$3, account_id=$4, password_hash=$5, salt= $6 WHERE mxid=$7`,
+		user.pidPtr(), user.ManagementRoom, user.LastConnection,
+		sess.AccountID, sess.PasswordHash, sess.Salt,
 		user.MXID)
 	if err != nil {
 		user.log.Warnfln("Failed to update %s: %v", user.MXID, err)
@@ -175,7 +181,7 @@ func (user *User) SetPortalKeys(newKeys []PortalKeyWithMeta) error {
 	if err != nil {
 		return err
 	}
-	_, err = tx.Exec("DELETE FROM user_portal WHERE user_jid=$1", user.jidPtr())
+	_, err = tx.Exec("DELETE FROM user_portal WHERE user_pid=$1", user.pidPtr())
 	if err != nil {
 		_ = tx.Rollback()
 		return err
@@ -185,12 +191,12 @@ func (user *User) SetPortalKeys(newKeys []PortalKeyWithMeta) error {
 	for i, key := range newKeys {
 		pos := i * 4
 		valueStrings[i] = fmt.Sprintf("($%d, $%d, $%d, $%d)", pos+1, pos+2, pos+3, pos+4)
-		values[pos] = user.jidPtr()
-		values[pos+1] = key.JID
+		values[pos] = user.pidPtr()
+		values[pos+1] = key.PID
 		values[pos+2] = key.Receiver
 		values[pos+3] = key.InCommunity
 	}
-	query := fmt.Sprintf("INSERT INTO user_portal (user_jid, portal_jid, portal_receiver, in_community) VALUES %s",
+	query := fmt.Sprintf("INSERT INTO user_portal (user_pid, portal_pid, portal_receiver, in_community) VALUES %s",
 		strings.Join(valueStrings, ", "))
 	_, err = tx.Exec(query, values...)
 	if err != nil {
@@ -201,14 +207,14 @@ func (user *User) SetPortalKeys(newKeys []PortalKeyWithMeta) error {
 }
 
 func (user *User) IsInPortal(key PortalKey) bool {
-	row := user.db.QueryRow(`SELECT EXISTS(SELECT 1 FROM user_portal WHERE user_jid=$1 AND portal_jid=$2 AND portal_receiver=$3)`, user.jidPtr(), &key.JID, &key.Receiver)
+	row := user.db.QueryRow(`SELECT EXISTS(SELECT 1 FROM user_portal WHERE user_pid=$1 AND portal_pid=$2 AND portal_receiver=$3)`, user.pidPtr(), &key.PID, &key.Receiver)
 	var exists bool
 	_ = row.Scan(&exists)
 	return exists
 }
 
 func (user *User) GetPortalKeys() []PortalKey {
-	rows, err := user.db.Query(`SELECT portal_jid, portal_receiver FROM user_portal WHERE user_jid=$1`, user.jidPtr())
+	rows, err := user.db.Query(`SELECT portal_pid, portal_receiver FROM user_portal WHERE user_pid=$1`, user.pidPtr())
 	if err != nil {
 		user.log.Warnln("Failed to get user portal keys:", err)
 		return nil
@@ -216,7 +222,7 @@ func (user *User) GetPortalKeys() []PortalKey {
 	var keys []PortalKey
 	for rows.Next() {
 		var key PortalKey
-		err = rows.Scan(&key.JID, &key.Receiver)
+		err = rows.Scan(&key.PID, &key.Receiver)
 		if err != nil {
 			user.log.Warnln("Failed to scan row:", err)
 			continue
@@ -227,7 +233,7 @@ func (user *User) GetPortalKeys() []PortalKey {
 }
 
 func (user *User) GetInCommunityMap() map[PortalKey]bool {
-	rows, err := user.db.Query(`SELECT portal_jid, portal_receiver, in_community FROM user_portal WHERE user_jid=$1`, user.jidPtr())
+	rows, err := user.db.Query(`SELECT portal_pid, portal_receiver, in_community FROM user_portal WHERE user_pid=$1`, user.pidPtr())
 	if err != nil {
 		user.log.Warnln("Failed to get user portal keys:", err)
 		return nil
@@ -236,7 +242,7 @@ func (user *User) GetInCommunityMap() map[PortalKey]bool {
 	for rows.Next() {
 		var key PortalKey
 		var inCommunity bool
-		err = rows.Scan(&key.JID, &key.Receiver, &inCommunity)
+		err = rows.Scan(&key.PID, &key.Receiver, &inCommunity)
 		if err != nil {
 			user.log.Warnln("Failed to scan row:", err)
 			continue
@@ -247,10 +253,10 @@ func (user *User) GetInCommunityMap() map[PortalKey]bool {
 }
 
 func (user *User) CreateUserPortal(newKey PortalKeyWithMeta) {
-	user.log.Debugfln("Creating new portal %s for %s", newKey.PortalKey.JID, newKey.PortalKey.Receiver)
-	_, err := user.db.Exec(`INSERT INTO user_portal (user_jid, portal_jid, portal_receiver, in_community) VALUES ($1, $2, $3, $4)`,
-		user.jidPtr(),
-		newKey.PortalKey.JID, newKey.PortalKey.Receiver,
+	user.log.Debugfln("Creating new portal %s for receiver: %s", newKey.PortalKey.PID, newKey.PortalKey.Receiver)
+	_, err := user.db.Exec(`INSERT INTO user_portal (user_pid, portal_pid, portal_receiver, in_community) VALUES ($1, $2, $3, $4)`,
+		user.pidPtr(),
+		newKey.PortalKey.PID, newKey.PortalKey.Receiver,
 		newKey.InCommunity)
 	if err != nil {
 		user.log.Warnfln("Failed to insert %s: %v", user.MXID, err)

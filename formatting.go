@@ -1,4 +1,5 @@
-// mautrix-whatsapp - A Matrix-WhatsApp puppeting bridge.
+// matrix-pulsesms - A Matrix-PulseSMS puppeting bridge.
+// Copyright (C) 2021 Cam Sweeney
 // Copyright (C) 2020 Tulir Asokan
 //
 // This program is free software: you can redistribute it and/or modify
@@ -22,7 +23,7 @@ import (
 	"regexp"
 	"strings"
 
-	"github.com/Rhymen/go-whatsapp"
+	"github.com/treethought/pulsesms"
 
 	"maunium.net/go/mautrix/event"
 	"maunium.net/go/mautrix/format"
@@ -34,7 +35,7 @@ var boldRegex = regexp.MustCompile("([\\s>_~]|^)\\*(.+?)\\*([^a-zA-Z\\d]|$)")
 var strikethroughRegex = regexp.MustCompile("([\\s>_*]|^)~(.+?)~([^a-zA-Z\\d]|$)")
 var codeBlockRegex = regexp.MustCompile("```(?:.|\n)+?```")
 
-const mentionedJIDsContextKey = "net.maunium.whatsapp.mentioned_jids"
+const mentionedPIDsContextKey = "dev.spherics.pulsesms.mentioned_pids"
 
 type Formatter struct {
 	bridge *Bridge
@@ -53,15 +54,16 @@ func NewFormatter(bridge *Bridge) *Formatter {
 			TabsToSpaces: 4,
 			Newline:      "\n",
 
+			// use phone numbe like we are?
 			PillConverter: func(mxid, eventID string, ctx format.Context) string {
 				if mxid[0] == '@' {
 					puppet := bridge.GetPuppetByMXID(id.UserID(mxid))
 					if puppet != nil {
-						jids, ok := ctx[mentionedJIDsContextKey].([]whatsapp.JID)
+						pids, ok := ctx[mentionedPIDsContextKey].([]pulsesms.PhoneNumber)
 						if !ok {
-							ctx[mentionedJIDsContextKey] = []whatsapp.JID{puppet.JID}
+							ctx[mentionedPIDsContextKey] = []pulsesms.PhoneNumber{puppet.PID}
 						} else {
-							ctx[mentionedJIDsContextKey] = append(jids, puppet.JID)
+							ctx[mentionedPIDsContextKey] = append(pids, puppet.PID)
 						}
 						return "@" + puppet.PhoneNumber()
 					}
@@ -99,23 +101,22 @@ func NewFormatter(bridge *Bridge) *Formatter {
 			return fmt.Sprintf("<code>%s</code>", str)
 		},
 	}
-	formatter.waReplFuncText = map[*regexp.Regexp]func(string) string{
-	}
+	formatter.waReplFuncText = map[*regexp.Regexp]func(string) string{}
 	return formatter
 }
 
-func (formatter *Formatter) getMatrixInfoByJID(jid whatsapp.JID) (mxid id.UserID, displayname string) {
-	if user := formatter.bridge.GetUserByJID(jid); user != nil {
+func (formatter *Formatter) getMatrixInfoByPID(pid pulsesms.PhoneNumber) (mxid id.UserID, displayname string) {
+	if user := formatter.bridge.GetUserByPID(pid); user != nil {
 		mxid = user.MXID
 		displayname = string(user.MXID)
-	} else if puppet := formatter.bridge.GetPuppetByJID(jid); puppet != nil {
+	} else if puppet := formatter.bridge.GetPuppetByPID(pid); puppet != nil {
 		mxid = puppet.MXID
 		displayname = puppet.Displayname
 	}
 	return
 }
 
-func (formatter *Formatter) ParseWhatsApp(content *event.MessageEventContent, mentionedJIDs []whatsapp.JID) {
+func (formatter *Formatter) ParsePulse(content *event.MessageEventContent, mentionedPIDs []pulsesms.PhoneNumber) {
 	output := html.EscapeString(content.Body)
 	for regex, replacement := range formatter.waReplString {
 		output = regex.ReplaceAllString(output, replacement)
@@ -123,9 +124,9 @@ func (formatter *Formatter) ParseWhatsApp(content *event.MessageEventContent, me
 	for regex, replacer := range formatter.waReplFunc {
 		output = regex.ReplaceAllStringFunc(output, replacer)
 	}
-	for _, jid := range mentionedJIDs {
-		mxid, displayname := formatter.getMatrixInfoByJID(jid)
-		number := "@" + strings.Replace(jid, whatsapp.NewUserSuffix, "", 1)
+	for _, pid := range mentionedPIDs {
+		mxid, displayname := formatter.getMatrixInfoByPID(pid)
+		number := "@" + pid
 		output = strings.Replace(output, number, fmt.Sprintf(`<a href="https://matrix.to/#/%s">%s</a>`, mxid, displayname), -1)
 		content.Body = strings.Replace(content.Body, number, displayname, -1)
 	}
@@ -139,9 +140,10 @@ func (formatter *Formatter) ParseWhatsApp(content *event.MessageEventContent, me
 	}
 }
 
-func (formatter *Formatter) ParseMatrix(html string) (string, []whatsapp.JID) {
+// TODO: returnn phone numbers?
+func (formatter *Formatter) ParseMatrix(html string) (string, []pulsesms.PhoneNumber) {
 	ctx := make(format.Context)
 	result := formatter.matrixHTMLParser.Parse(html, ctx)
-	mentionedJIDs, _ := ctx[mentionedJIDsContextKey].([]whatsapp.JID)
-	return result, mentionedJIDs
+	mentionedPIDs, _ := ctx[mentionedPIDsContextKey].([]pulsesms.PhoneNumber)
+	return result, mentionedPIDs
 }

@@ -1,4 +1,5 @@
-// mautrix-whatsapp - A Matrix-WhatsApp puppeting bridge.
+// matrix-pulsesms - A Matrix-PulseSMS puppeting bridge.
+// Copyright (C) 2021 Cam Sweeney
 // Copyright (C) 2020 Tulir Asokan
 //
 // This program is free software: you can redistribute it and/or modify
@@ -17,13 +18,12 @@
 package main
 
 import (
-	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
+	"regexp"
 	"sort"
-	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -34,21 +34,18 @@ import (
 	"maunium.net/go/mautrix/appservice"
 	"maunium.net/go/mautrix/pushrules"
 
-	"github.com/Rhymen/go-whatsapp"
-	waBinary "github.com/Rhymen/go-whatsapp/binary"
-	waProto "github.com/Rhymen/go-whatsapp/binary/proto"
-
 	"maunium.net/go/mautrix"
 	"maunium.net/go/mautrix/event"
 	"maunium.net/go/mautrix/format"
 	"maunium.net/go/mautrix/id"
 
-	"maunium.net/go/mautrix-whatsapp/database"
+	"github.com/treethought/matrix-pulsesms/database"
+	"github.com/treethought/pulsesms"
 )
 
 type User struct {
 	*database.User
-	Conn *whatsapp.Conn
+	Pulse *pulsesms.Client
 
 	bridge *Bridge
 	log    log.Logger
@@ -61,6 +58,7 @@ type User struct {
 
 	ConnectionErrors int
 	CommunityID      string
+	SpaceID          id.RoomID
 
 	cleanDisconnection  bool
 	batteryWarningsSent int
@@ -98,30 +96,30 @@ func (bridge *Bridge) GetUserByMXID(userID id.UserID) *User {
 	return user
 }
 
-func (bridge *Bridge) GetUserByJID(userID whatsapp.JID) *User {
+func (bridge *Bridge) GetUserByPID(userID pulsesms.PhoneNumber) *User {
 	bridge.usersLock.Lock()
 	defer bridge.usersLock.Unlock()
-	user, ok := bridge.usersByJID[userID]
+	user, ok := bridge.usersByPID[userID]
 	if !ok {
-		return bridge.loadDBUser(bridge.DB.User.GetByJID(userID), nil)
+		return bridge.loadDBUser(bridge.DB.User.GetByPID(userID), nil)
 	}
 	return user
 }
 
-func (user *User) addToJIDMap() {
+func (user *User) addToPIDMap() {
 	user.bridge.usersLock.Lock()
-	user.bridge.usersByJID[user.JID] = user
+	user.bridge.usersByPID[user.PID] = user
 	user.bridge.usersLock.Unlock()
 }
 
-func (user *User) removeFromJIDMap() {
+func (user *User) removeFromPIDMap() {
 	user.bridge.usersLock.Lock()
-	jidUser, ok := user.bridge.usersByJID[user.JID]
-	if ok && user == jidUser {
-		delete(user.bridge.usersByJID, user.JID)
+	pidUser, ok := user.bridge.usersByPID[user.PID]
+	if ok && user == pidUser {
+		delete(user.bridge.usersByPID, user.PID)
 	}
 	user.bridge.usersLock.Unlock()
-	user.bridge.Metrics.TrackLoginState(user.JID, false)
+	user.bridge.Metrics.TrackLoginState(user.PID, false)
 	user.sendBridgeStatus(AsmuxPong{Error: AsmuxWANotLoggedIn})
 }
 
@@ -151,8 +149,8 @@ func (bridge *Bridge) loadDBUser(dbUser *database.User, mxid *id.UserID) *User {
 	}
 	user := bridge.NewUser(dbUser)
 	bridge.usersByMXID[user.MXID] = user
-	if len(user.JID) > 0 {
-		bridge.usersByJID[user.JID] = user
+	if len(user.PID) > 0 {
+		bridge.usersByPID[user.PID] = user
 	}
 	if len(user.ManagementRoom) > 0 {
 		bridge.managementRooms[user.ManagementRoom] = user
@@ -166,9 +164,9 @@ func (user *User) GetPortals() []*Portal {
 
 	user.bridge.portalsLock.Lock()
 	for i, key := range keys {
-		portal, ok := user.bridge.portalsByJID[key]
+		portal, ok := user.bridge.portalsByPID[key]
 		if !ok {
-			portal = user.bridge.loadDBPortal(user.bridge.DB.Portal.GetByJID(key), &key)
+			portal = user.bridge.loadDBPortal(user.bridge.DB.Portal.GetByPID(key), &key)
 		}
 		portals[i] = portal
 	}
@@ -206,7 +204,7 @@ func (user *User) GetManagementRoom() id.RoomID {
 			return user.ManagementRoom
 		}
 		resp, err := user.bridge.Bot.CreateRoom(&mautrix.ReqCreateRoom{
-			Topic:    "WhatsApp bridge notices",
+			Topic:    "PulseSMS bridge notices",
 			IsDirect: true,
 		})
 		if err != nil {
@@ -230,11 +228,12 @@ func (user *User) SetManagementRoom(roomID id.RoomID) {
 	user.Update()
 }
 
-func (user *User) SetSession(session *whatsapp.Session) {
+func (user *User) SetSession(session *pulsesms.KeyCredentials) {
+	user.log.Debugfln("setting session for pulse account %s", session.AccountID)
 	if session == nil {
 		user.Session = nil
 		user.LastConnection = 0
-	} else if len(session.Wid) > 0 {
+	} else if len(session.AccountID) > 0 {
 		user.Session = session
 	} else {
 		return
@@ -243,91 +242,134 @@ func (user *User) SetSession(session *whatsapp.Session) {
 }
 
 func (user *User) Connect(evenIfNoSession bool) bool {
+	user.log.Info("connecting user")
+
+	// TODO
+	// user.connLock.Lock()
+	// if user.Pulse != nil {
+	// 	user.connLock.Unlock()
+	// 	if user.Pulse.IsConnected() {
+	// 		return true
+	// 	} else {
+	// 		return user.RestoreSession()
+	// 	}
+	// } else if !evenIfNoSession && user.Session == nil {
+	// 	user.connLock.Unlock()
+	// 	return false
+	// }
+	// user.log.Debugln("Connecting to Pulse")
+	// if user.Session != nil {
+	// 	user.sendBridgeStatus(AsmuxPong{Error: AsmuxWAConnecting})
+	// }
+	// timeout := time.Duration(user.bridge.Config.Bridge.ConnectionTimeout)
+	// if timeout == 0 {
+	// 	timeout = 20
+	// }
+
+	// TODO: maybe stream and check connection here
+
 	user.connLock.Lock()
-	if user.Conn != nil {
-		user.connLock.Unlock()
-		if user.Conn.IsConnected() {
-			return true
-		} else {
-			return user.RestoreSession()
-		}
-	} else if !evenIfNoSession && user.Session == nil {
-		user.connLock.Unlock()
+	if user.Pulse == nil {
+		user.Pulse = pulsesms.New()
+	}
+
+	if user.Session == nil {
+		user.bridge.Bot.SendText(user.ManagementRoom, "credentials are not set, please login")
 		return false
 	}
-	user.log.Debugln("Connecting to WhatsApp")
-	if user.Session != nil {
-		user.sendBridgeStatus(AsmuxPong{Error: AsmuxWAConnecting})
+
+	creds := pulsesms.KeyCredentials{
+		AccountID:    user.Session.AccountID,
+		PasswordHash: user.Session.PasswordHash,
+		Salt:         user.Session.Salt,
 	}
-	timeout := time.Duration(user.bridge.Config.Bridge.ConnectionTimeout)
-	if timeout == 0 {
-		timeout = 20
+	err := user.Pulse.GenerateKey(creds)
+	if err != nil {
+		user.bridge.Bot.SendText(user.ManagementRoom, "failed to connnect with pulse, please login again")
+		return false
 	}
-	user.Conn = whatsapp.NewConn(&whatsapp.Options{
-		Timeout:         timeout * time.Second,
-		LongClientName:  user.bridge.Config.WhatsApp.OSName,
-		ShortClientName: user.bridge.Config.WhatsApp.BrowserName,
-		ClientVersion:   WAVersion,
-		Log:             user.log.Sub("Conn"),
-		Handler:         []whatsapp.Handler{user},
+
+	user.Pulse.SetMessageHandler(func(m pulsesms.Message) {
+		user.HandleEvent(m)
 	})
+
+	user.log.Infofln("starting pulse stream")
+	go func() {
+		for {
+			if !user.Pulse.IsConnected() {
+				user.sendBridgeNotice("pulse connection has been lost, reconnecting...")
+				go func() {
+					for {
+						if user.Pulse.IsConnected() {
+							user.sendBridgeNotice("reconnected successfully")
+							return
+						}
+					}
+				}()
+				user.Pulse.Stream()
+			}
+		}
+	}()
 	user.setupAdminTestHooks()
 	user.connLock.Unlock()
-	return user.RestoreSession()
+	return true
+	// return user.RestoreSession()
 }
 
 func (user *User) DeleteConnection() {
 	user.connLock.Lock()
-	if user.Conn == nil {
+	if user.Pulse == nil {
 		user.connLock.Unlock()
 		return
 	}
-	err := user.Conn.Disconnect()
-	if err != nil && err != whatsapp.ErrNotConnected {
-		user.log.Warnln("Error disconnecting: %v", err)
-	}
-	user.Conn.RemoveHandlers()
-	user.Conn = nil
-	user.bridge.Metrics.TrackConnectionState(user.JID, false)
+	user.Pulse.Disconnect()
+	user.bridge.Metrics.TrackConnectionState(user.PID, false)
 	user.sendBridgeStatus(AsmuxPong{Error: AsmuxWANotConnected})
 	user.connLock.Unlock()
 }
 
 func (user *User) RestoreSession() bool {
-	if user.Session != nil {
-		user.Conn.SetSession(*user.Session)
-		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
-		defer cancel()
-		err := user.Conn.Restore(true, ctx)
-		if err == whatsapp.ErrAlreadyLoggedIn {
-			return true
-		} else if err != nil {
-			user.log.Errorln("Failed to restore session:", err)
-			if errors.Is(err, whatsapp.ErrUnpaired) {
-				user.sendMarkdownBridgeAlert("\u26a0 Failed to connect to WhatsApp: unpaired from phone. " +
-					"To re-pair your phone, log in again.")
-				user.removeFromJIDMap()
-				//user.JID = ""
-				user.SetSession(nil)
-				user.DeleteConnection()
-				return false
-			} else {
-				user.sendBridgeStatus(AsmuxPong{Error: AsmuxWANotConnected})
-				user.sendMarkdownBridgeAlert("\u26a0 Failed to connect to WhatsApp. Make sure WhatsApp " +
-					"on your phone is reachable and use `reconnect` to try connecting again.")
-			}
-			user.log.Debugln("Disconnecting due to failed session restore...")
-			err = user.Conn.Disconnect()
-			if err != nil {
-				user.log.Errorln("Failed to disconnect after failed session restore:", err)
-			}
-			return false
-		}
-		user.ConnectionErrors = 0
-		user.log.Debugln("Session restored successfully")
-		user.PostLogin()
+	//TODO
+	if user.Session == nil {
+		return false
 	}
-	return true
+
+	return false
+
+	//if user.Session != nil {
+	//	user.Conn.SetSession(*user.Session)
+	//	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
+	//	defer cancel()
+	//	err := user.Conn.Restore(true, ctx)
+	//	if err == whatsapp.ErrAlreadyLoggedIn {
+	//		return true
+	//	} else if err != nil {
+	//		user.log.Errorln("Failed to restore session:", err)
+	//		if errors.Is(err, whatsapp.ErrUnpaired) {
+	//			user.sendMarkdownBridgeAlert("\u26a0 Failed to connect to WhatsApp: unpaired from phone. " +
+	//				"To re-pair your phone, log in again.")
+	//			user.removeFromPIDMap()
+	//			//user.PID = ""
+	//			user.SetSession(nil)
+	//			user.DeleteConnection()
+	//			return false
+	//		} else {
+	//			user.sendBridgeStatus(AsmuxPong{Error: AsmuxWANotConnected})
+	//			user.sendMarkdownBridgeAlert("\u26a0 Failed to connect to WhatsApp. Make sure WhatsApp " +
+	//				"on your phone is reachable and use `reconnect` to try connecting again.")
+	//		}
+	//		user.log.Debugln("Disconnecting due to failed session restore...")
+	//		err = user.Conn.Disconnect()
+	//		if err != nil {
+	//			user.log.Errorln("Failed to disconnect after failed session restore:", err)
+	//		}
+	//		return false
+	//	}
+	//	user.ConnectionErrors = 0
+	//	user.log.Debugln("Session restored successfully")
+	//	user.PostLogin()
+	//}
+	//return true
 }
 
 func (user *User) HasSession() bool {
@@ -335,11 +377,12 @@ func (user *User) HasSession() bool {
 }
 
 func (user *User) IsConnected() bool {
-	return user.Conn != nil && user.Conn.IsConnected() && user.Conn.IsLoggedIn()
+	return user.Pulse != nil && user.Pulse.IsConnected() && user.Session != nil
 }
 
 func (user *User) IsLoginInProgress() bool {
-	return user.Conn != nil && user.Conn.IsLoginInProgress()
+	return false
+	// return user.Conn != nil && user.Conn.IsLoginInProgress()
 }
 
 func (user *User) loginQrChannel(ce *CommandEvent, qrChan <-chan string, eventIDChan chan<- id.EventID) {
@@ -395,56 +438,53 @@ func (user *User) loginQrChannel(ce *CommandEvent, qrChan <-chan string, eventID
 }
 
 func (user *User) Login(ce *CommandEvent) {
-	qrChan := make(chan string, 3)
-	eventIDChan := make(chan id.EventID, 1)
-	go user.loginQrChannel(ce, qrChan, eventIDChan)
-	session, jid, err := user.Conn.Login(qrChan, nil)
-	qrChan <- "stop"
+	if len(ce.Args) < 3 {
+		ce.Reply("invalid usage:\vuse login username password phonenumber")
+	}
+
+	username, pw, number := ce.Args[0], ce.Args[1], ce.Args[2]
+	user.bridge.Log.Debugf("Logging into pulse as %s", username)
+
+	// TODO maybe do this with custom puppet
+	reg, err := regexp.Compile("[^a-zA-Z0-9]+")
 	if err != nil {
-		var eventID id.EventID
-		select {
-		case eventID = <-eventIDChan:
-		default:
-		}
-		reply := event.MessageEventContent{
-			MsgType: event.MsgText,
-		}
-		if err == whatsapp.ErrAlreadyLoggedIn {
-			reply.Body = "You're already logged in"
-		} else if err == whatsapp.ErrLoginInProgress {
-			reply.Body = "You have a login in progress already."
-		} else if err == whatsapp.ErrLoginTimedOut {
-			reply.Body = "QR code scan timed out. Please try again."
-		} else {
-			user.log.Warnln("Failed to log in:", err)
-			reply.Body = fmt.Sprintf("Unknown error while logging in: %v", err)
-		}
-		msg := reply
-		if eventID != "" {
-			msg.NewContent = &reply
-			msg.RelatesTo = &event.RelatesTo{
-				Type:    event.RelReplace,
-				EventID: eventID,
-			}
-		}
-		_, _ = ce.Bot.SendMessageEvent(ce.RoomID, event.EventMessage, &msg)
+		ce.Reply("invalid phone number")
 		return
 	}
+	cleanID := reg.ReplaceAllString(number, "")
+	user.log.Infofln("setting user PID to %s, was %s", cleanID, user.PID)
+	user.PID = cleanID
+
+	if user.Pulse == nil {
+		user.Pulse = pulsesms.New()
+	}
+
+	creds := pulsesms.BasicCredentials{Username: username, Password: pw}
+	err = user.Pulse.Login(creds)
+	if err != nil {
+		ce.Reply("failed to login")
+		return
+	}
+
+	user.log.Debugln("Successful login as", username, "via command")
+	user.ConnectionErrors = 0
+	session := user.Pulse.GetKeyCredentials()
 	// TODO there's a bit of duplication between this and the provisioning API login method
 	//      Also between the two logout methods (commands.go and provisioning.go)
-	user.log.Debugln("Successful login as", jid, "via command")
+	// user.log.Debugln("Successful login as", pid, "via command")
 	user.ConnectionErrors = 0
-	user.JID = strings.Replace(jid, whatsapp.OldUserSuffix, whatsapp.NewUserSuffix, 1)
-	user.addToJIDMap()
+	// user.PID = strings.Replace(pid, whatsapp.OldUserSuffix, whatsapp.NewUserSuffix, 1)
+	// user.addToPIDMap()
+
 	user.SetSession(&session)
 	ce.Reply("Successfully logged in, synchronizing chats...")
 	user.PostLogin()
 }
 
 type Chat struct {
-	whatsapp.Chat
+	pulsesms.Chat
 	Portal  *Portal
-	Contact whatsapp.Contact
+	Contact pulsesms.Contact
 }
 
 type ChatList []Chat
@@ -463,8 +503,8 @@ func (cl ChatList) Swap(i, j int) {
 
 func (user *User) PostLogin() {
 	user.sendBridgeStatus(AsmuxPong{OK: true})
-	user.bridge.Metrics.TrackConnectionState(user.JID, true)
-	user.bridge.Metrics.TrackLoginState(user.JID, true)
+	user.bridge.Metrics.TrackConnectionState(user.PID, true)
+	user.bridge.Metrics.TrackLoginState(user.PID, true)
 	user.bridge.Metrics.TrackBufferLength(user.MXID, len(user.messageOutput))
 	if !atomic.CompareAndSwapInt32(&user.syncing, 0, 1) {
 		// TODO we should cleanly stop the old sync and start a new one instead of not starting a new one
@@ -484,7 +524,7 @@ func (user *User) tryAutomaticDoublePuppeting() {
 		return
 	}
 	user.log.Debugln("Checking if double puppeting needs to be enabled")
-	puppet := user.bridge.GetPuppetByJID(user.JID)
+	puppet := user.bridge.GetPuppetByPID(user.PID)
 	if len(puppet.CustomMXID) > 0 {
 		user.log.Debugln("User already has double-puppeting enabled")
 		// Custom puppet already enabled
@@ -522,37 +562,56 @@ func (user *User) sendMarkdownBridgeAlert(formatString string, args ...interface
 
 func (user *User) postConnPing() bool {
 	user.log.Debugln("Making post-connection ping")
-	var err error
-	for i := 0; ; i++ {
-		err = user.Conn.AdminTest()
-		if err == nil {
-			user.log.Debugln("Post-connection ping OK")
-			return true
-		} else if errors.Is(err, whatsapp.ErrConnectionTimeout) && i < 5 {
-			user.log.Warnfln("Post-connection ping timed out, sending new one")
-		} else {
-			break
-		}
-	}
-	user.log.Errorfln("Post-connection ping failed: %v. Disconnecting and then reconnecting after a second", err)
-	disconnectErr := user.Conn.Disconnect()
-	if disconnectErr != nil {
-		user.log.Warnln("Error while disconnecting after failed post-connection ping:", disconnectErr)
-	}
-	user.sendBridgeStatus(AsmuxPong{Error: AsmuxWANotConnected})
-	user.bridge.Metrics.TrackDisconnection(user.MXID)
-	go func() {
-		time.Sleep(1 * time.Second)
-		user.tryReconnect(fmt.Sprintf("Post-connection ping failed: %v", err))
-	}()
+	// user.log.Debugln("NOT IMPLEMENTED")
+	// var err error
+	// for i := 0; ; i++ {
+	// 	err = user.Conn.AdminTest()
+	// 	if err == nil {
+	// 		user.log.Debugln("Post-connection ping OK")
+	// 		return true
+	// 	} else if errors.Is(err, whatsapp.ErrConnectionTimeout) && i < 5 {
+	// 		user.log.Warnfln("Post-connection ping timed out, sending new one")
+	// 	} else {
+	// 		break
+	// 	}
+	// }
+	// user.log.Errorfln("Post-connection ping failed: %v. Disconnecting and then reconnecting after a second", err)
+	// disconnectErr := user.Conn.Disconnect()
+	// if disconnectErr != nil {
+	// 	user.log.Warnln("Error while disconnecting after failed post-connection ping:", disconnectErr)
+	// }
+	// user.sendBridgeStatus(AsmuxPong{Error: AsmuxWANotConnected})
+	// user.bridge.Metrics.TrackDisconnection(user.MXID)
+	// go func() {
+	// 	time.Sleep(1 * time.Second)
+	// 	user.tryReconnect(fmt.Sprintf("Post-connection ping failed: %v", err))
+	// }()
 	return false
 }
 
 func (user *User) intPostLogin() {
+
+	go func() {
+		user.log.Debugfln("intPostLogin syncing...")
+		chatList := []pulsesms.Chat{}
+		err := user.Pulse.Sync()
+		if err != nil {
+			return
+		}
+		user.log.Infofln("finished syncing pulse")
+
+		for _, chat := range user.Pulse.Store.Chats {
+			// user.log.Debugfln("init post: %v", chat.ID)
+			chatList = append(chatList, chat)
+		}
+		user.HandleChatList(chatList)
+	}()
+
 	defer atomic.StoreInt32(&user.syncing, 0)
 	defer user.syncWait.Done()
 	user.lastReconnection = time.Now().Unix()
-	user.createCommunity()
+	// user.createCommunity()
+	user.createSpace()
 	user.tryAutomaticDoublePuppeting()
 
 	user.log.Debugln("Waiting for chat list receive confirmation")
@@ -581,103 +640,38 @@ func (user *User) intPostLogin() {
 }
 
 type NormalMessage interface {
-	GetInfo() whatsapp.MessageInfo
+	// GetInfo() whatsapp.MessageInfo
+	GetInfo() pulsesms.Message
 }
 
 func (user *User) HandleEvent(event interface{}) {
 	switch v := event.(type) {
-	case NormalMessage:
-		info := v.GetInfo()
-		user.messageInput <- PortalMessage{info.RemoteJid, user, v, info.Timestamp}
-	case whatsapp.MessageRevocation:
-		user.messageInput <- PortalMessage{v.RemoteJid, user, v, 0}
-	case whatsapp.StreamEvent:
-		user.HandleStreamEvent(v)
-	case []whatsapp.Chat:
-		user.HandleChatList(v)
-	case []whatsapp.Contact:
-		user.HandleContactList(v)
-	case error:
-		user.HandleError(v)
-	case whatsapp.Contact:
-		go user.HandleNewContact(v)
-	case whatsapp.BatteryMessage:
-		user.HandleBatteryMessage(v)
-	case whatsapp.CallInfo:
-		user.HandleCallInfo(v)
-	case whatsapp.PresenceEvent:
-		go user.HandlePresence(v)
-	case whatsapp.JSONMsgInfo:
-		go user.HandleMsgInfo(v)
-	case whatsapp.ReceivedMessage:
-		user.HandleReceivedMessage(v)
-	case whatsapp.ReadMessage:
-		user.HandleReadMessage(v)
-	case whatsapp.JSONCommand:
-		user.HandleCommand(v)
-	case whatsapp.ChatUpdate:
-		user.HandleChatUpdate(v)
-	case whatsapp.ConnInfo:
-		user.HandleConnInfo(v)
-	case whatsapp.MuteMessage:
-		portal := user.bridge.GetPortalByJID(user.PortalKey(v.JID))
-		if portal != nil {
-			go user.updateChatMute(nil, portal, v.MutedUntil)
+	// TODO prbly need to configure message types
+	case pulsesms.Message:
+		user.log.Infofln("handling pulse message")
+		chat, ok := user.Pulse.GetChat(v.ChatID())
+		if !ok {
+			user.log.Warnfln("could not retrieve chat for received message, chatID: %s", v.ChatID())
+			return
 		}
-	case whatsapp.ArchiveMessage:
-		portal := user.bridge.GetPortalByJID(user.PortalKey(v.JID))
-		if portal != nil {
-			go user.updateChatTag(nil, portal, user.bridge.Config.Bridge.ArchiveTag, v.IsArchived)
-		}
-	case whatsapp.PinMessage:
-		portal := user.bridge.GetPortalByJID(user.PortalKey(v.JID))
-		if portal != nil {
-			go user.updateChatTag(nil, portal, user.bridge.Config.Bridge.PinnedTag, v.IsPinned)
-		}
-	case whatsapp.RawJSONMessage:
-		user.HandleJSONMessage(v)
-	case *waProto.WebMessageInfo:
-		user.updateLastConnectionIfNecessary()
-		// TODO trace log
-		//user.log.Debugfln("WebMessageInfo: %+v", v)
-	case *waBinary.Node:
-		user.log.Debugfln("Unknown binary message: %+v", v)
+		user.messageInput <- PortalMessage{chat.ID, user, v, uint64(v.Timestamp)}
 	default:
 		user.log.Debugfln("Unknown type of event in HandleEvent: %T", v)
 	}
 }
 
-func (user *User) HandleStreamEvent(evt whatsapp.StreamEvent) {
-	if evt.Type == whatsapp.StreamSleep {
-		if user.lastReconnection+60 > time.Now().Unix() {
-			user.lastReconnection = 0
-			user.log.Infoln("Stream went to sleep soon after reconnection, making new post-connection ping in 20 seconds")
-			go func() {
-				time.Sleep(20 * time.Second)
-				// TODO if this happens during the post-login sync, it can get stuck forever
-				// TODO check if the above is still true
-				user.postConnPing()
-			}()
-		}
-	} else {
-		user.log.Infofln("Stream event: %+v", evt)
-	}
+func (user *User) HandleStreamEvent(evt pulsesms.Message) {
+	user.log.Infofln("Stream event: %+v", evt)
 }
 
-func (user *User) HandleChatList(chats []whatsapp.Chat) {
-	user.log.Infoln("Chat list received")
-	chatMap := make(map[string]whatsapp.Chat)
-	for _, chat := range user.Conn.Store.Chats {
-		chatMap[chat.JID] = chat
-	}
-	for _, chat := range chats {
-		chatMap[chat.JID] = chat
-	}
+func (user *User) HandleChatList(chats []pulsesms.Chat) {
+	user.log.Infofln("handling chat list with length: %d", len(chats))
+
 	select {
 	case user.chatListReceived <- struct{}{}:
 	default:
 	}
-	go user.syncPortals(chatMap, false)
+	go user.syncPortals(user.Pulse.Store.Chats, false)
 }
 
 func (user *User) updateChatMute(intent *appservice.IntentAPI, portal *Portal, mutedUntil int64) {
@@ -707,7 +701,7 @@ func (user *User) updateChatMute(intent *appservice.IntentAPI, portal *Portal, m
 
 type CustomTagData struct {
 	Order        json.Number `json:"order"`
-	DoublePuppet bool        `json:"net.maunium.whatsapp.puppet"`
+	DoublePuppet bool        `json:"dev.spherics.pulsesms.puppet"`
 }
 
 type CustomTagEventContent struct {
@@ -747,81 +741,96 @@ func (user *User) updateChatTag(intent *appservice.IntentAPI, portal *Portal, ta
 
 type CustomReadReceipt struct {
 	Timestamp    int64 `json:"ts,omitempty"`
-	DoublePuppet bool  `json:"net.maunium.whatsapp.puppet,omitempty"`
+	DoublePuppet bool  `json:"dev.spherics.pulsesms.puppet,omitempty"`
 }
 
 func (user *User) syncChatDoublePuppetDetails(doublePuppet *Puppet, chat Chat, justCreated bool) {
 	if doublePuppet == nil || doublePuppet.CustomIntent() == nil {
 		return
 	}
-	intent := doublePuppet.CustomIntent()
-	if chat.UnreadCount == 0 && (justCreated || !user.bridge.Config.Bridge.MarkReadOnlyOnCreate) {
-		lastMessage := user.bridge.DB.Message.GetLastInChatBefore(chat.Portal.Key, chat.ReceivedAt.Unix())
-		if lastMessage != nil {
-			err := intent.MarkReadWithContent(chat.Portal.MXID, lastMessage.MXID, &CustomReadReceipt{DoublePuppet: true})
-			if err != nil {
-				user.log.Warnln("Failed to mark %s in %s as read after backfill: %v", lastMessage.MXID, chat.Portal.MXID, err)
-			}
-		}
-	} else if chat.UnreadCount == -1 {
-		user.log.Debugfln("Invalid unread count (missing field?) in chat info %+v", chat.Source)
-	}
-	if justCreated || !user.bridge.Config.Bridge.TagOnlyOnCreate {
-		user.updateChatMute(intent, chat.Portal, chat.MutedUntil)
-		user.updateChatTag(intent, chat.Portal, user.bridge.Config.Bridge.ArchiveTag, chat.IsArchived)
-		user.updateChatTag(intent, chat.Portal, user.bridge.Config.Bridge.PinnedTag, chat.IsPinned)
-	}
+	// intent := doublePuppet.CustomIntent()
+	// if chat.UnreadCount == 0 && (justCreated || !user.bridge.Config.Bridge.MarkReadOnlyOnCreate) {
+	// 	lastMessage := user.bridge.DB.Message.GetLastInChatBefore(chat.Portal.Key, chat.ReceivedAt.Unix())
+	// 	if lastMessage != nil {
+	// 		err := intent.MarkReadWithContent(chat.Portal.MXID, lastMessage.MXID, &CustomReadReceipt{DoublePuppet: true})
+	// 		if err != nil {
+	// 			user.log.Warnln("Failed to mark %s in %s as read after backfill: %v", lastMessage.MXID, chat.Portal.MXID, err)
+	// 		}
+	// 	}
+	// } else if chat.UnreadCount == -1 {
+	// 	user.log.Debugfln("Invalid unread count (missing field?) in chat info %+v", chat.Source)
+	// }
+
+	// if justCreated || !user.bridge.Config.Bridge.TagOnlyOnCreate {
+	// user.updateChatMute(intent, chat.Portal, chat.MutedUntil)
+	// user.updateChatTag(intent, chat.Portal, user.bridge.Config.Bridge.ArchiveTag, chat.IsArchived)
+	// user.updateChatTag(intent, chat.Portal, user.bridge.Config.Bridge.PinnedTag, chat.IsPinned)
+	// }
 }
 
 func (user *User) syncPortal(chat Chat) {
+	user.log.Infofln("syncing portal for chat %s", chat.Name)
 	// Don't sync unless chat meta sync is enabled or portal doesn't exist
 	if user.bridge.Config.Bridge.ChatMetaSync || len(chat.Portal.MXID) == 0 {
-		chat.Portal.Sync(user, chat.Contact)
+		chat.Portal.Sync(user, chat.Chat)
 	}
-	err := chat.Portal.BackfillHistory(user, chat.LastMessageTime)
+	// TODO: get last message time insntead of now
+	err := chat.Portal.BackfillHistory(user, time.Now().Unix()-86400)
 	if err != nil {
 		chat.Portal.log.Errorln("Error backfilling history:", err)
 	}
 }
 
-func (user *User) collectChatList(chatMap map[string]whatsapp.Chat) ChatList {
+func (user *User) collectChatList(chatMap map[pulsesms.ChatID]pulsesms.Chat) ChatList {
 	if chatMap == nil {
-		chatMap = user.Conn.Store.Chats
+		chatMap = user.Pulse.Store.Chats
 	}
-	user.log.Infoln("Reading chat list")
+	user.log.Infoln("collecting chat list")
 	chats := make(ChatList, 0, len(chatMap))
 	existingKeys := user.GetInCommunityMap()
 	portalKeys := make([]database.PortalKeyWithMeta, 0, len(chatMap))
 	for _, chat := range chatMap {
-		portal := user.GetPortalByJID(chat.JID)
+		user.log.Debugfln("handling chat %s, pid: %s", chat.Name, chat.ID)
+		user.log.Debugfln("members: %v", chat.Members)
+
+		portal := user.GetPortalByPID(chat.ID)
+
+		// TODO group chats instead of first member?
+		// or can prbly read from Store contacts directly
+		firstMember := chat.Members[0]
+		// portal := user.GetPortalByPID(firstMember)
 
 		chats = append(chats, Chat{
 			Chat:    chat,
 			Portal:  portal,
-			Contact: user.Conn.Store.Contacts[chat.JID],
+			Contact: user.Pulse.Store.Contacts[firstMember],
 		})
-		var inCommunity, ok bool
-		if inCommunity, ok = existingKeys[portal.Key]; !ok || !inCommunity {
-			inCommunity = user.addPortalToCommunity(portal)
+
+		user.log.Debugfln("adding chat for contact %s", user.Pulse.Store.Contacts[firstMember].Name)
+		var inSpace, ok bool
+		if inSpace, ok = existingKeys[portal.Key]; !ok || !inSpace {
+			inSpace = user.addPortalToSpace(portal)
 			if portal.IsPrivateChat() {
-				puppet := user.bridge.GetPuppetByJID(portal.Key.JID)
-				user.addPuppetToCommunity(puppet)
+				puppet := user.bridge.GetPuppetByPID(portal.Key.PID)
+				user.addPuppetToSpace(puppet)
 			}
 		}
-		portalKeys = append(portalKeys, database.PortalKeyWithMeta{PortalKey: portal.Key, InCommunity: inCommunity})
+		portalKeys = append(portalKeys, database.PortalKeyWithMeta{PortalKey: portal.Key, InCommunity: inSpace})
 	}
 	user.log.Infoln("Read chat list, updating user-portal mapping")
 	err := user.SetPortalKeys(portalKeys)
 	if err != nil {
 		user.log.Warnln("Failed to update user-portal mapping:", err)
+
 	}
 	sort.Sort(chats)
 	return chats
 }
 
-func (user *User) syncPortals(chatMap map[string]whatsapp.Chat, createAll bool) {
+func (user *User) syncPortals(chatMap map[pulsesms.ChatID]pulsesms.Chat, createAll bool) {
+	user.log.Infoln("syncing portals")
 	// TODO use contexts instead of checking if user.Conn is the same?
-	connAtStart := user.Conn
+	connAtStart := user.Pulse
 
 	chats := user.collectChatList(chatMap)
 
@@ -829,26 +838,31 @@ func (user *User) syncPortals(chatMap map[string]whatsapp.Chat, createAll bool) 
 	if limit < 0 {
 		limit = len(chats)
 	}
-	if user.Conn != connAtStart {
+	if user.Pulse != connAtStart {
 		user.log.Debugln("Connection seems to have changed before sync, cancelling")
 		return
 	}
-	now := time.Now().Unix()
+	// now := time.Now().UTC().UnixNano() / 1e6
+	// now := time.Now().Unix()
 	user.log.Infoln("Syncing portals")
 	doublePuppet := user.bridge.GetPuppetByCustomMXID(user.MXID)
 	for i, chat := range chats {
-		if chat.LastMessageTime+user.bridge.Config.Bridge.SyncChatMaxAge < now {
-			break
-		}
-		create := (chat.LastMessageTime >= user.LastConnection && user.LastConnection > 0) || i < limit
+		user.log.Debugfln("Syncing portal for %+v", chat.Chat.Name)
+
+		// if chat.LastMessageTime+user.bridge.Config.Bridge.SyncChatMaxAge < now {
+		// 	break
+		// }
+		// create := (chat.LastMessageTime >= user.LastConnection && user.LastConnection > 0) || i < limit
+		create := i < limit
 		if len(chat.Portal.MXID) > 0 || create || createAll {
-			user.log.Debugfln("Syncing chat %+v", chat.Chat.Source)
+			user.log.Debugfln("Syncing chat %+v", chat.Chat.Name)
 			justCreated := len(chat.Portal.MXID) == 0
 			user.syncPortal(chat)
 			user.syncChatDoublePuppetDetails(doublePuppet, chat, justCreated)
 		}
 	}
-	if user.Conn != connAtStart {
+
+	if user.Pulse != connAtStart {
 		user.log.Debugln("Connection seems to have changed during sync, cancelling")
 		return
 	}
@@ -863,21 +877,24 @@ func (user *User) syncPortals(chatMap map[string]whatsapp.Chat, createAll bool) 
 
 func (user *User) getDirectChats() map[id.UserID][]id.RoomID {
 	res := make(map[id.UserID][]id.RoomID)
-	privateChats := user.bridge.DB.Portal.FindPrivateChats(user.JID)
+	privateChats := user.bridge.DB.Portal.FindPrivateChats(user.PID)
 	for _, portal := range privateChats {
 		if len(portal.MXID) > 0 {
-			res[user.bridge.FormatPuppetMXID(portal.Key.JID)] = []id.RoomID{portal.MXID}
+			res[user.bridge.FormatPuppetMXID(portal.Key.PID)] = []id.RoomID{portal.MXID}
 		}
 	}
 	return res
 }
 
 func (user *User) UpdateDirectChats(chats map[id.UserID][]id.RoomID) {
+	user.bridge.Log.Info("updating direct chats")
 	if !user.bridge.Config.Bridge.SyncDirectChatList {
+		user.bridge.Log.Debugfln("syncDirectChatList disabled in config skipping")
 		return
 	}
 	puppet := user.bridge.GetPuppetByCustomMXID(user.MXID)
 	if puppet == nil || puppet.CustomIntent() == nil {
+		user.bridge.Log.Debugfln("puppet or puppet intent nil, skipping")
 		return
 	}
 	intent := puppet.CustomIntent()
@@ -919,37 +936,42 @@ func (user *User) UpdateDirectChats(chats map[id.UserID][]id.RoomID) {
 	}
 }
 
-func (user *User) HandleContactList(contacts []whatsapp.Contact) {
-	contactMap := make(map[whatsapp.JID]whatsapp.Contact)
+func (user *User) HandleContactList(contacts []pulsesms.Contact) {
+	user.log.Infoln("handling contact list")
+	contactMap := make(map[pulsesms.PhoneNumber]pulsesms.Contact)
 	for _, contact := range contacts {
-		contactMap[contact.JID] = contact
+		contactMap[contact.PhoneNumber] = contact
 	}
 	go user.syncPuppets(contactMap)
 }
 
-func (user *User) syncPuppets(contacts map[whatsapp.JID]whatsapp.Contact) {
+func (user *User) syncPuppets(contacts map[pulsesms.PhoneNumber]pulsesms.Contact) {
+	user.log.Infoln("syncing puppets")
 	if contacts == nil {
-		contacts = user.Conn.Store.Contacts
+		contacts = user.Pulse.Store.Contacts
 	}
 
-	_, hasSelf := contacts[user.JID]
+	_, hasSelf := contacts[user.PID]
 	if !hasSelf {
-		contacts[user.JID] = whatsapp.Contact{
-			Name:   user.pushName,
-			Notify: user.pushName,
-			JID:    user.JID,
+		contacts[user.PID] = pulsesms.Contact{
+			Name: user.pushName,
+			// Notify: user.pushName,
+			PhoneNumber: user.PID,
 		}
 	}
 
 	user.log.Infoln("Syncing puppet info from contacts")
-	for jid, contact := range contacts {
-		if strings.HasSuffix(jid, whatsapp.NewUserSuffix) {
-			puppet := user.bridge.GetPuppetByJID(contact.JID)
-			puppet.Sync(user, contact)
-		} else if strings.HasSuffix(jid, whatsapp.BroadcastSuffix) {
-			portal := user.GetPortalByJID(contact.JID)
-			portal.Sync(user, contact)
-		}
+	for _, contact := range contacts {
+		puppet := user.bridge.GetPuppetByPID(contact.PhoneNumber)
+		puppet.Sync(user, contact)
+
+		// if strings.HasSuffix(pid, whatsapp.NewUserSuffix) {
+		// 	puppet := user.bridge.GetPuppetByPID(contact.PhoneNumber)
+		// 	puppet.Sync(user, contact)
+		// } else if strings.HasSuffix(pid, whatsapp.BroadcastSuffix) {
+		// 	portal := user.GetPortalByPID(contact.PhoneNumber)
+		// 	portal.Sync(user, contact)
+		// }
 	}
 	user.log.Infoln("Finished syncing puppet info from contacts")
 }
@@ -961,131 +983,54 @@ func (user *User) updateLastConnectionIfNecessary() {
 }
 
 func (user *User) HandleError(err error) {
-	if !errors.Is(err, whatsapp.ErrInvalidWsData) {
-		user.log.Errorfln("WhatsApp error: %v", err)
-	}
-	if closed, ok := err.(*whatsapp.ErrConnectionClosed); ok {
-		user.bridge.Metrics.TrackDisconnection(user.MXID)
-		if closed.Code == 1000 && user.cleanDisconnection {
-			user.cleanDisconnection = false
-			if !user.bridge.Config.Bridge.AggressiveReconnect {
-				user.sendBridgeStatus(AsmuxPong{Error: AsmuxWANotConnected})
-				user.bridge.Metrics.TrackConnectionState(user.JID, false)
-				user.log.Infoln("Clean disconnection by server")
-				return
-			} else {
-				user.log.Debugln("Clean disconnection by server, but aggressive reconnection is enabled")
-			}
-		}
-		go user.tryReconnect(fmt.Sprintf("Your WhatsApp connection was closed with websocket status code %d", closed.Code))
-	} else if failed, ok := err.(*whatsapp.ErrConnectionFailed); ok {
-		disconnectErr := user.Conn.Disconnect()
-		if disconnectErr != nil {
-			user.log.Warnln("Failed to disconnect after connection fail:", disconnectErr)
-		}
-		user.bridge.Metrics.TrackDisconnection(user.MXID)
-		user.ConnectionErrors++
-		go user.tryReconnect(fmt.Sprintf("Your WhatsApp connection failed: %v", failed.Err))
-	} else if err == whatsapp.ErrPingFalse {
-		disconnectErr := user.Conn.Disconnect()
-		if disconnectErr != nil {
-			user.log.Warnln("Failed to disconnect after failed ping:", disconnectErr)
-		}
-		user.bridge.Metrics.TrackDisconnection(user.MXID)
-		user.ConnectionErrors++
-		go user.tryReconnect(fmt.Sprintf("Your WhatsApp connection failed: %v", err))
-	}
+	user.Pulse.Disconnect()
+	go user.tryReconnect(fmt.Sprintf("Your PulseSMS connection failed: %v", err))
+	// if !errors.Is(err, whatsapp.ErrInvalidWsData) {
+	// 	user.log.Errorfln("WhatsApp error: %v", err)
+	// }
+	// if closed, ok := err.(*whatsapp.ErrConnectionClosed); ok {
+	// 	user.bridge.Metrics.TrackDisconnection(user.MXID)
+	// 	if closed.Code == 1000 && user.cleanDisconnection {
+	// 		user.cleanDisconnection = false
+	// 		if !user.bridge.Config.Bridge.AggressiveReconnect {
+	// 			user.sendBridgeStatus(AsmuxPong{Error: AsmuxWANotConnected})
+	// 			user.bridge.Metrics.TrackConnectionState(user.PID, false)
+	// 			user.log.Infoln("Clean disconnection by server")
+	// 			return
+	// 		} else {
+	// 			user.log.Debugln("Clean disconnection by server, but aggressive reconnection is enabled")
+	// 		}
+	// 	}
+	// 	go user.tryReconnect(fmt.Sprintf("Your WhatsApp connection was closed with websocket status code %d", closed.Code))
+	// } else if failed, ok := err.(*whatsapp.ErrConnectionFailed); ok {
+	// 	user.Pulse.Disconnect()
+	// 	user.bridge.Metrics.TrackDisconnection(user.MXID)
+	// 	user.ConnectionErrors++
+	// 	go user.tryReconnect(fmt.Sprintf("Your WhatsApp connection failed: %v", failed.Err))
+	// } else if err == whatsapp.ErrPingFalse {
+	// 	disconnectErr := user.Conn.Disconnect()
+	// 	if disconnectErr != nil {
+	// 		user.log.Warnln("Failed to disconnect after failed ping:", disconnectErr)
+	// 	}
+	// 	user.bridge.Metrics.TrackDisconnection(user.MXID)
+	// 	user.ConnectionErrors++
+	// 	go user.tryReconnect(fmt.Sprintf("Your WhatsApp connection failed: %v", err))
+	// }
 	// Otherwise unknown error, probably mostly harmless
 }
 
 func (user *User) tryReconnect(msg string) {
-	user.bridge.Metrics.TrackConnectionState(user.JID, false)
-	if user.ConnectionErrors > user.bridge.Config.Bridge.MaxConnectionAttempts {
-		user.sendMarkdownBridgeAlert("%s. Use the `reconnect` command to reconnect.", msg)
-		user.sendBridgeStatus(AsmuxPong{Error: AsmuxWANotConnected})
-		return
-	}
-	if user.bridge.Config.Bridge.ReportConnectionRetry {
-		user.sendBridgeNotice("%s. Reconnecting...", msg)
-		// Don't want the same error to be repeated
-		msg = ""
-	}
-	var tries uint
-	var exponentialBackoff bool
-	baseDelay := time.Duration(user.bridge.Config.Bridge.ConnectionRetryDelay)
-	if baseDelay < 0 {
-		exponentialBackoff = true
-		baseDelay = -baseDelay + 1
-	}
-	delay := baseDelay
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	user.cancelReconnect = cancel
-	for user.ConnectionErrors <= user.bridge.Config.Bridge.MaxConnectionAttempts {
-		select {
-		case <-ctx.Done():
-			user.log.Debugln("tryReconnect context cancelled, aborting reconnection attempts")
-			return
-		default:
-		}
-		user.sendBridgeStatus(AsmuxPong{Error: AsmuxWAConnecting})
-		err := user.Conn.Restore(true, ctx)
-		if err == nil {
-			user.ConnectionErrors = 0
-			if user.bridge.Config.Bridge.ReportConnectionRetry {
-				user.sendBridgeNotice("Reconnected successfully")
-			}
-			user.PostLogin()
-			return
-		} else if errors.Is(err, whatsapp.ErrBadRequest) {
-			user.log.Warnln("Got init 400 error when trying to reconnect, resetting connection...")
-			err = user.Conn.Disconnect()
-			if err != nil {
-				user.log.Debugln("Error while disconnecting for connection reset:", err)
-			}
-		} else if errors.Is(err, whatsapp.ErrUnpaired) {
-			user.log.Errorln("Got init 401 (unpaired) error when trying to reconnect, not retrying")
-			user.removeFromJIDMap()
-			//user.JID = ""
-			user.SetSession(nil)
-			user.DeleteConnection()
-			user.sendMarkdownBridgeAlert("\u26a0 Failed to reconnect to WhatsApp: unpaired from phone. " +
-				"To re-pair your phone, log in again.")
-			user.sendBridgeStatus(AsmuxPong{Error: AsmuxWANotLoggedIn})
-			return
-		} else if errors.Is(err, whatsapp.ErrAlreadyLoggedIn) {
-			user.log.Warnln("Reconnection said we're already logged in, not trying anymore")
-			return
-		} else {
-			user.log.Errorln("Error while trying to reconnect after disconnection:", err)
-		}
-		tries++
-		user.ConnectionErrors++
-		if user.ConnectionErrors <= user.bridge.Config.Bridge.MaxConnectionAttempts {
-			if exponentialBackoff {
-				delay = (1 << tries) + baseDelay
-			}
-			if user.bridge.Config.Bridge.ReportConnectionRetry {
-				user.sendBridgeNotice("Reconnection attempt failed: %v. Retrying in %d seconds...", err, delay)
-			}
-			time.Sleep(delay * time.Second)
-		}
-	}
+	// TODO: handle reconnect tries, look at upstream for whatsapp implementation
+	user.Connect(false)
 
-	user.sendBridgeStatus(AsmuxPong{Error: AsmuxWANotConnected})
-	if user.bridge.Config.Bridge.ReportConnectionRetry {
-		user.sendMarkdownBridgeAlert("%d reconnection attempts failed. Use the `reconnect` command to try to reconnect manually.", tries)
-	} else {
-		user.sendMarkdownBridgeAlert("\u26a0 %s. Additionally, %d reconnection attempts failed. Use the `reconnect` command to try to reconnect.", msg, tries)
-	}
 }
 
-func (user *User) PortalKey(jid whatsapp.JID) database.PortalKey {
-	return database.NewPortalKey(jid, user.JID)
+func (user *User) PortalKey(pid pulsesms.ChatID) database.PortalKey {
+	return database.NewPortalKey(pid, user.PID)
 }
 
-func (user *User) GetPortalByJID(jid whatsapp.JID) *Portal {
-	return user.bridge.GetPortalByJID(user.PortalKey(jid))
+func (user *User) GetPortalByPID(pid pulsesms.ChatID) *Portal {
+	return user.bridge.GetPortalByPID(user.PortalKey(pid))
 }
 
 func (user *User) runMessageRingBuffer() {
@@ -1106,295 +1051,160 @@ func (user *User) handleMessageLoop() {
 		select {
 		case msg := <-user.messageOutput:
 			user.bridge.Metrics.TrackBufferLength(user.MXID, len(user.messageOutput))
-			user.GetPortalByJID(msg.chat).messages <- msg
+			user.GetPortalByPID(msg.chat).messages <- msg
 		case <-user.syncStart:
 			user.log.Debugln("Processing of incoming messages is locked")
-			user.bridge.Metrics.TrackSyncLock(user.JID, true)
+			user.bridge.Metrics.TrackSyncLock(user.PID, true)
 			user.syncWait.Wait()
-			user.bridge.Metrics.TrackSyncLock(user.JID, false)
+			user.bridge.Metrics.TrackSyncLock(user.PID, false)
 			user.log.Debugln("Processing of incoming messages unlocked")
 		}
 	}
 }
 
-func (user *User) HandleNewContact(contact whatsapp.Contact) {
+// TODO
+func (user *User) HandleNewContact(contact pulsesms.Contact) {
 	user.log.Debugfln("Contact message: %+v", contact)
-	if strings.HasSuffix(contact.JID, whatsapp.OldUserSuffix) {
-		contact.JID = strings.Replace(contact.JID, whatsapp.OldUserSuffix, whatsapp.NewUserSuffix, -1)
-	}
-	if strings.HasSuffix(contact.JID, whatsapp.NewUserSuffix) {
-		puppet := user.bridge.GetPuppetByJID(contact.JID)
-		puppet.UpdateName(user, contact)
-	} else if strings.HasSuffix(contact.JID, whatsapp.BroadcastSuffix) {
-		portal := user.GetPortalByJID(contact.JID)
-		portal.UpdateName(contact.Name, "", nil, true)
-	}
 }
 
-func (user *User) HandleBatteryMessage(battery whatsapp.BatteryMessage) {
-	user.log.Debugfln("Battery message: %+v", battery)
-	var notice string
-	if !battery.Plugged && battery.Percentage < 15 && user.batteryWarningsSent < 1 {
-		notice = fmt.Sprintf("Phone battery low (%d %% remaining)", battery.Percentage)
-		user.batteryWarningsSent = 1
-	} else if !battery.Plugged && battery.Percentage < 5 && user.batteryWarningsSent < 2 {
-		notice = fmt.Sprintf("Phone battery very low (%d %% remaining)", battery.Percentage)
-		user.batteryWarningsSent = 2
-	} else if battery.Percentage > 15 || battery.Plugged {
-		user.batteryWarningsSent = 0
-	}
-	if notice != "" {
-		go user.sendBridgeNotice("%s", notice)
-	}
+// func (user *User) HandleMsgInfo(info whatsapp.JSONMsgInfo) {
+func (user *User) HandleMsgInfo(info pulsesms.Message) {
+	// TODO: add command to message or more likely create message wrapper
+	return
+	// if (info.Command == whatsapp.MsgInfoCommandAck || info.Command == whatsapp.MsgInfoCommandAcks) && info.Acknowledgement == whatsapp.AckMessageRead {
+	// 	portal := user.GetPortalByPID(info.ToPID)
+	// 	if len(portal.MXID) == 0 {
+	// 		return
+	// 	}
+
+	// 	intent := user.bridge.GetPuppetByPID(info.SenderPID).IntentFor(portal)
+	// 	for _, msgID := range info.IDs {
+	// 		msg := user.bridge.DB.Message.GetByPID(portal.Key, msgID)
+	// 		if msg == nil || msg.IsFakeMXID() {
+	// 			continue
+	// 		}
+
+	// 		err := intent.MarkReadWithContent(portal.MXID, msg.MXID, &CustomReadReceipt{DoublePuppet: intent.IsCustomPuppet})
+	// 		if err != nil {
+	// 			user.log.Warnln("Failed to mark message %s as read by %s: %v", msg.MXID, info.SenderPID, err)
+	// 		}
+	// 	}
+	// }
 }
 
-type FakeMessage struct {
-	Text  string
-	ID    string
-	Alert bool
-}
+// func (user *User) HandleReceivedMessage(received whatsapp.ReceivedMessage) {
+// 	if received.Type == "read" {
+// 		go user.markSelfRead(received.pid, received.Index)
+// 	} else {
+// 		user.log.Debugfln("Unknown received message type: %+v", received)
+// 	}
+// }
 
-func (user *User) HandleCallInfo(info whatsapp.CallInfo) {
-	if info.Data != nil {
-		return
-	}
-	data := FakeMessage{
-		ID: info.ID,
-	}
-	switch info.Type {
-	case whatsapp.CallOffer:
-		if !user.bridge.Config.Bridge.CallNotices.Start {
-			return
-		}
-		data.Text = "Incoming call"
-		data.Alert = true
-	case whatsapp.CallOfferVideo:
-		if !user.bridge.Config.Bridge.CallNotices.Start {
-			return
-		}
-		data.Text = "Incoming video call"
-		data.Alert = true
-	case whatsapp.CallTerminate:
-		if !user.bridge.Config.Bridge.CallNotices.End {
-			return
-		}
-		data.Text = "Call ended"
-		data.ID += "E"
-	default:
-		return
-	}
-	portal := user.GetPortalByJID(info.From)
-	if portal != nil {
-		portal.messages <- PortalMessage{info.From, user, data, 0}
-	}
-}
+// func (user *User) HandleReadMessage(read whatsapp.ReadMessage) {
+// 	user.log.Debugfln("Received chat read message: %+v", read)
+// 	go user.markSelfRead(read.pid, "")
+// }
 
-func (user *User) HandlePresence(info whatsapp.PresenceEvent) {
-	puppet := user.bridge.GetPuppetByJID(info.SenderJID)
-	switch info.Status {
-	case whatsapp.PresenceUnavailable:
-		_ = puppet.DefaultIntent().SetPresence("offline")
-	case whatsapp.PresenceAvailable:
-		if len(puppet.typingIn) > 0 && puppet.typingAt+15 > time.Now().Unix() {
-			portal := user.bridge.GetPortalByMXID(puppet.typingIn)
-			_, _ = puppet.IntentFor(portal).UserTyping(puppet.typingIn, false, 0)
-			puppet.typingIn = ""
-			puppet.typingAt = 0
-		} else {
-			_ = puppet.DefaultIntent().SetPresence("online")
-		}
-	case whatsapp.PresenceComposing:
-		portal := user.GetPortalByJID(info.JID)
-		if len(puppet.typingIn) > 0 && puppet.typingAt+15 > time.Now().Unix() {
-			if puppet.typingIn == portal.MXID {
-				return
-			}
-			_, _ = puppet.IntentFor(portal).UserTyping(puppet.typingIn, false, 0)
-		}
-		puppet.typingIn = portal.MXID
-		puppet.typingAt = time.Now().Unix()
-		_, _ = puppet.IntentFor(portal).UserTyping(portal.MXID, true, 15*1000)
-	}
-}
+// func (user *User) markSelfRead(pid, messageID string) {
+// 	if strings.HasSuffix(pid, whatsapp.OldUserSuffix) {
+// 		pid = strings.Replace(pid, whatsapp.OldUserSuffix, whatsapp.NewUserSuffix, -1)
+// 	}
+// 	puppet := user.bridge.GetPuppetByPID(user.PID)
+// 	if puppet == nil {
+// 		return
+// 	}
+// 	intent := puppet.CustomIntent()
+// 	if intent == nil {
+// 		return
+// 	}
+// 	portal := user.GetPortalByPID(pid)
+// 	if portal == nil {
+// 		return
+// 	}
+// 	var message *database.Message
+// 	if messageID == "" {
+// 		message = user.bridge.DB.Message.GetLastInChat(portal.Key)
+// 		if message == nil {
+// 			return
+// 		}
+// 		user.log.Debugfln("User read chat %s/%s in WhatsApp mobile (last known event: %s/%s)", portal.Key.PID, portal.MXID, message.PID, message.MXID)
+// 	} else {
+// 		message = user.bridge.DB.Message.GetByPID(portal.Key, messageID)
+// 		if message == nil || message.IsFakeMXID() {
+// 			return
+// 		}
+// 		user.log.Debugfln("User read message %s/%s in %s/%s in WhatsApp mobile", message.PID, message.MXID, portal.Key.PID, portal.MXID)
+// 	}
+// 	err := intent.MarkReadWithContent(portal.MXID, message.MXID, &CustomReadReceipt{DoublePuppet: true})
+// 	if err != nil {
+// 		user.log.Warnfln("Failed to bridge own read receipt in %s: %v", pid, err)
+// 	}
+// }
 
-func (user *User) HandleMsgInfo(info whatsapp.JSONMsgInfo) {
-	if (info.Command == whatsapp.MsgInfoCommandAck || info.Command == whatsapp.MsgInfoCommandAcks) && info.Acknowledgement == whatsapp.AckMessageRead {
-		portal := user.GetPortalByJID(info.ToJID)
-		if len(portal.MXID) == 0 {
-			return
-		}
+// TODO: pulse conversation update
+// func (user *User) HandleChatUpdate(cmd whatsapp.ChatUpdate) {
+// 	if cmd.Command != whatsapp.ChatUpdateCommandAction {
+// 		return
+// 	}
 
-		intent := user.bridge.GetPuppetByJID(info.SenderJID).IntentFor(portal)
-		for _, msgID := range info.IDs {
-			msg := user.bridge.DB.Message.GetByJID(portal.Key, msgID)
-			if msg == nil || msg.IsFakeMXID() {
-				continue
-			}
+// 	portal := user.GetPortalByPID(cmd.PID)
+// 	if len(portal.MXID) == 0 {
+// 		if cmd.Data.Action == whatsapp.ChatActionIntroduce || cmd.Data.Action == whatsapp.ChatActionCreate {
+// 			go func() {
+// 				err := portal.CreateMatrixRoom(user)
+// 				if err != nil {
+// 					user.log.Errorln("Failed to create portal room after receiving join event:", err)
+// 				}
+// 			}()
+// 		}
+// 		return
+// 	}
 
-			err := intent.MarkReadWithContent(portal.MXID, msg.MXID, &CustomReadReceipt{DoublePuppet: intent.IsCustomPuppet})
-			if err != nil {
-				user.log.Warnln("Failed to mark message %s as read by %s: %v", msg.MXID, info.SenderJID, err)
-			}
-		}
-	}
-}
+// 	// These don't come down the message history :(
+// 	switch cmd.Data.Action {
+// 	case whatsapp.ChatActionAddTopic:
+// 		go portal.UpdateTopic(cmd.Data.AddTopic.Topic, cmd.Data.SenderPID, nil, true)
+// 	case whatsapp.ChatActionRemoveTopic:
+// 		go portal.UpdateTopic("", cmd.Data.SenderPID, nil, true)
+// 	case whatsapp.ChatActionRemove:
+// 		// We ignore leaving groups in the message history to avoid accidentally leaving rejoined groups,
+// 		// but if we get a real-time command that says we left, it should be safe to bridge it.
+// 		if !user.bridge.Config.Bridge.ChatMetaSync {
+// 			for _, pid := range cmd.Data.UserChange.PIDs {
+// 				if pid == user.PID {
+// 					go portal.HandleWhatsAppKick(nil, cmd.Data.SenderPID, cmd.Data.UserChange.PIDs)
+// 					break
+// 				}
+// 			}
+// 		}
+// 	}
 
-func (user *User) HandleReceivedMessage(received whatsapp.ReceivedMessage) {
-	if received.Type == "read" {
-		go user.markSelfRead(received.Jid, received.Index)
-	} else {
-		user.log.Debugfln("Unknown received message type: %+v", received)
-	}
-}
+// 	if !user.bridge.Config.Bridge.ChatMetaSync {
+// 		// Ignore chat update commands, we're relying on the message history.
+// 		return
+// 	}
 
-func (user *User) HandleReadMessage(read whatsapp.ReadMessage) {
-	user.log.Debugfln("Received chat read message: %+v", read)
-	go user.markSelfRead(read.Jid, "")
-}
-
-func (user *User) markSelfRead(jid, messageID string) {
-	if strings.HasSuffix(jid, whatsapp.OldUserSuffix) {
-		jid = strings.Replace(jid, whatsapp.OldUserSuffix, whatsapp.NewUserSuffix, -1)
-	}
-	puppet := user.bridge.GetPuppetByJID(user.JID)
-	if puppet == nil {
-		return
-	}
-	intent := puppet.CustomIntent()
-	if intent == nil {
-		return
-	}
-	portal := user.GetPortalByJID(jid)
-	if portal == nil {
-		return
-	}
-	var message *database.Message
-	if messageID == "" {
-		message = user.bridge.DB.Message.GetLastInChat(portal.Key)
-		if message == nil {
-			return
-		}
-		user.log.Debugfln("User read chat %s/%s in WhatsApp mobile (last known event: %s/%s)", portal.Key.JID, portal.MXID, message.JID, message.MXID)
-	} else {
-		message = user.bridge.DB.Message.GetByJID(portal.Key, messageID)
-		if message == nil || message.IsFakeMXID() {
-			return
-		}
-		user.log.Debugfln("User read message %s/%s in %s/%s in WhatsApp mobile", message.JID, message.MXID, portal.Key.JID, portal.MXID)
-	}
-	err := intent.MarkReadWithContent(portal.MXID, message.MXID, &CustomReadReceipt{DoublePuppet: true})
-	if err != nil {
-		user.log.Warnfln("Failed to bridge own read receipt in %s: %v", jid, err)
-	}
-}
-
-func (user *User) HandleCommand(cmd whatsapp.JSONCommand) {
-	switch cmd.Type {
-	case whatsapp.CommandPicture:
-		if strings.HasSuffix(cmd.JID, whatsapp.NewUserSuffix) {
-			puppet := user.bridge.GetPuppetByJID(cmd.JID)
-			go puppet.UpdateAvatar(user, cmd.ProfilePicInfo)
-		} else if user.bridge.Config.Bridge.ChatMetaSync {
-			portal := user.GetPortalByJID(cmd.JID)
-			go portal.UpdateAvatar(user, cmd.ProfilePicInfo, true)
-		}
-	case whatsapp.CommandDisconnect:
-		if cmd.Kind == "replaced" {
-			user.cleanDisconnection = true
-			go user.sendMarkdownBridgeAlert("\u26a0 Your WhatsApp connection was closed by the server because you opened another WhatsApp Web client.\n\n" +
-				"Use the `reconnect` command to disconnect the other client and resume bridging.")
-		} else {
-			user.log.Warnln("Unknown kind of disconnect:", string(cmd.Raw))
-			go user.sendMarkdownBridgeAlert("\u26a0 Your WhatsApp connection was closed by the server (reason code: %s).\n\n"+
-				"Use the `reconnect` command to reconnect.", cmd.Kind)
-		}
-	}
-}
-
-func (user *User) HandleChatUpdate(cmd whatsapp.ChatUpdate) {
-	if cmd.Command != whatsapp.ChatUpdateCommandAction {
-		return
-	}
-
-	portal := user.GetPortalByJID(cmd.JID)
-	if len(portal.MXID) == 0 {
-		if cmd.Data.Action == whatsapp.ChatActionIntroduce || cmd.Data.Action == whatsapp.ChatActionCreate {
-			go func() {
-				err := portal.CreateMatrixRoom(user)
-				if err != nil {
-					user.log.Errorln("Failed to create portal room after receiving join event:", err)
-				}
-			}()
-		}
-		return
-	}
-
-	// These don't come down the message history :(
-	switch cmd.Data.Action {
-	case whatsapp.ChatActionAddTopic:
-		go portal.UpdateTopic(cmd.Data.AddTopic.Topic, cmd.Data.SenderJID, nil, true)
-	case whatsapp.ChatActionRemoveTopic:
-		go portal.UpdateTopic("", cmd.Data.SenderJID, nil, true)
-	case whatsapp.ChatActionRemove:
-		// We ignore leaving groups in the message history to avoid accidentally leaving rejoined groups,
-		// but if we get a real-time command that says we left, it should be safe to bridge it.
-		if !user.bridge.Config.Bridge.ChatMetaSync {
-			for _, jid := range cmd.Data.UserChange.JIDs {
-				if jid == user.JID {
-					go portal.HandleWhatsAppKick(nil, cmd.Data.SenderJID, cmd.Data.UserChange.JIDs)
-					break
-				}
-			}
-		}
-	}
-
-	if !user.bridge.Config.Bridge.ChatMetaSync {
-		// Ignore chat update commands, we're relying on the message history.
-		return
-	}
-
-	switch cmd.Data.Action {
-	case whatsapp.ChatActionNameChange:
-		go portal.UpdateName(cmd.Data.NameChange.Name, cmd.Data.SenderJID, nil, true)
-	case whatsapp.ChatActionPromote:
-		go portal.ChangeAdminStatus(cmd.Data.UserChange.JIDs, true)
-	case whatsapp.ChatActionDemote:
-		go portal.ChangeAdminStatus(cmd.Data.UserChange.JIDs, false)
-	case whatsapp.ChatActionAnnounce:
-		go portal.RestrictMessageSending(cmd.Data.Announce)
-	case whatsapp.ChatActionRestrict:
-		go portal.RestrictMetadataChanges(cmd.Data.Restrict)
-	case whatsapp.ChatActionRemove:
-		go portal.HandleWhatsAppKick(nil, cmd.Data.SenderJID, cmd.Data.UserChange.JIDs)
-	case whatsapp.ChatActionAdd:
-		go portal.HandleWhatsAppInvite(cmd.Data.SenderJID, nil, cmd.Data.UserChange.JIDs)
-	case whatsapp.ChatActionIntroduce:
-		if cmd.Data.SenderJID != "unknown" {
-			go portal.Sync(user, whatsapp.Contact{JID: portal.Key.JID})
-		}
-	}
-}
-
-func (user *User) HandleConnInfo(info whatsapp.ConnInfo) {
-	if user.Session != nil && info.Connected && len(info.ClientToken) > 0 {
-		user.log.Debugln("Received new tokens")
-		user.Session.ClientToken = info.ClientToken
-		user.Session.ServerToken = info.ServerToken
-		user.Session.Wid = info.WID
-		user.Update()
-	}
-	if len(info.PushName) > 0 {
-		user.pushName = info.PushName
-	}
-}
-
-func (user *User) HandleJSONMessage(evt whatsapp.RawJSONMessage) {
-	if !json.Valid(evt.RawMessage) {
-		return
-	}
-	user.log.Debugfln("JSON message with tag %s: %s", evt.Tag, evt.RawMessage)
-	user.updateLastConnectionIfNecessary()
-}
+// 	switch cmd.Data.Action {
+// 	case whatsapp.ChatActionNameChange:
+// 		go portal.UpdateName(cmd.Data.NameChange.Name, cmd.Data.SenderPID, nil, true)
+// 	case whatsapp.ChatActionPromote:
+// 		go portal.ChangeAdminStatus(cmd.Data.UserChange.PIDs, true)
+// 	case whatsapp.ChatActionDemote:
+// 		go portal.ChangeAdminStatus(cmd.Data.UserChange.PIDs, false)
+// 	case whatsapp.ChatActionAnnounce:
+// 		go portal.RestrictMessageSending(cmd.Data.Announce)
+// 	case whatsapp.ChatActionRestrict:
+// 		go portal.RestrictMetadataChanges(cmd.Data.Restrict)
+// 	case whatsapp.ChatActionRemove:
+// 		go portal.HandleWhatsAppKick(nil, cmd.Data.SenderPID, cmd.Data.UserChange.PIDs)
+// 	case whatsapp.ChatActionAdd:
+// 		go portal.HandleWhatsAppInvite(cmd.Data.SenderPID, nil, cmd.Data.UserChange.PIDs)
+// 	case whatsapp.ChatActionIntroduce:
+// 		if cmd.Data.SenderPID != "unknown" {
+// 			go portal.Sync(user, whatsapp.Contact{PID: portal.Key.PID})
+// 		}
+// 	}
+// }
 
 func (user *User) NeedsRelaybot(portal *Portal) bool {
 	return !user.HasSession() || !user.IsInPortal(portal.Key)

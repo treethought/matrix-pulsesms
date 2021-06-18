@@ -1,4 +1,5 @@
-// mautrix-whatsapp - A Matrix-WhatsApp puppeting bridge.
+// matrix-pulsesms - A Matrix-PulseSMS puppeting bridge.
+// Copyright (C) 2021 Cam Sweeney
 // Copyright (C) 2020 Tulir Asokan
 //
 // This program is free software: you can redistribute it and/or modify
@@ -25,8 +26,6 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/Rhymen/go-whatsapp"
-
 	flag "maunium.net/go/mauflag"
 	log "maunium.net/go/maulogger/v2"
 
@@ -35,19 +34,20 @@ import (
 	"maunium.net/go/mautrix/event"
 	"maunium.net/go/mautrix/id"
 
-	"maunium.net/go/mautrix-whatsapp/config"
-	"maunium.net/go/mautrix-whatsapp/database"
-	"maunium.net/go/mautrix-whatsapp/database/upgrades"
+	"github.com/treethought/matrix-pulsesms/config"
+	"github.com/treethought/matrix-pulsesms/database"
+	"github.com/treethought/matrix-pulsesms/database/upgrades"
+	"github.com/treethought/pulsesms"
 )
 
 var (
 	// These are static
-	Name = "mautrix-whatsapp"
-	URL  = "https://github.com/tulir/mautrix-whatsapp"
+	Name = "matrix-pulsesms"
+	URL  = "https://github.com/treethought/matrix-pulsems"
 	// This is changed when making a release
-	Version = "0.1.6"
+	Version = "0.0.1"
 	// This is filled by init()
-	WAVersion = ""
+	WAVersion     = ""
 	VersionString = ""
 	// These are filled at build time with the -X linker flag
 	Tag       = "unknown"
@@ -70,7 +70,7 @@ func init() {
 			Version = fmt.Sprintf("%s%s.unknown", Version, suffix)
 		}
 	}
-	mautrix.DefaultUserAgent = fmt.Sprintf("mautrix-whatsapp/%s %s", Version, mautrix.DefaultUserAgent)
+	mautrix.DefaultUserAgent = fmt.Sprintf("mautrix-pulsesms/%s %s", Version, mautrix.DefaultUserAgent)
 	WAVersion = strings.FieldsFunc(Version, func(r rune) bool { return r == '-' || r == '+' })[0]
 	VersionString = fmt.Sprintf("%s %s (%s)", Name, Version, BuildTime)
 }
@@ -149,14 +149,14 @@ type Bridge struct {
 	Metrics        *MetricsHandler
 
 	usersByMXID         map[id.UserID]*User
-	usersByJID          map[whatsapp.JID]*User
+	usersByPID          map[pulsesms.ChatID]*User
 	usersLock           sync.Mutex
 	managementRooms     map[id.RoomID]*User
 	managementRoomsLock sync.Mutex
 	portalsByMXID       map[id.RoomID]*Portal
-	portalsByJID        map[database.PortalKey]*Portal
+	portalsByPID        map[database.PortalKey]*Portal
 	portalsLock         sync.Mutex
-	puppets             map[whatsapp.JID]*Puppet
+	puppets             map[pulsesms.ChatID]*Puppet
 	puppetsByCustomMXID map[id.UserID]*Puppet
 	puppetsLock         sync.Mutex
 }
@@ -175,11 +175,11 @@ type Crypto interface {
 func NewBridge() *Bridge {
 	bridge := &Bridge{
 		usersByMXID:         make(map[id.UserID]*User),
-		usersByJID:          make(map[whatsapp.JID]*User),
+		usersByPID:          make(map[pulsesms.ChatID]*User),
 		managementRooms:     make(map[id.RoomID]*User),
 		portalsByMXID:       make(map[id.RoomID]*Portal),
-		portalsByJID:        make(map[database.PortalKey]*Portal),
-		puppets:             make(map[whatsapp.JID]*Puppet),
+		portalsByPID:        make(map[database.PortalKey]*Portal),
+		puppets:             make(map[pulsesms.ChatID]*Puppet),
 		puppetsByCustomMXID: make(map[id.UserID]*Puppet),
 	}
 
@@ -288,11 +288,14 @@ func (bridge *Bridge) Start() {
 			os.Exit(19)
 		}
 	}
-	if bridge.Provisioning != nil {
-		bridge.Log.Debugln("Initializing provisioning API")
-		bridge.Provisioning.Init()
-	}
-	bridge.LoadRelaybot()
+	// if bridge.Provisioning != nil {
+	// 	bridge.Log.Debugln("Initializing provisioning API")
+	// 	bridge.Provisioning.Init()
+	// }
+
+	// bridge.LoadRelaybot()
+	// bridge.AS.Sync()
+
 	bridge.Log.Debugln("Starting application service HTTP server")
 	go bridge.AS.Start()
 	bridge.Log.Debugln("Starting event processor")
@@ -382,6 +385,7 @@ func (bridge *Bridge) StartUsers() {
 			}
 		}(loopuppet)
 	}
+
 }
 
 func (bridge *Bridge) Stop() {
@@ -391,15 +395,12 @@ func (bridge *Bridge) Stop() {
 	bridge.AS.Stop()
 	bridge.Metrics.Stop()
 	bridge.EventProcessor.Stop()
-	for _, user := range bridge.usersByJID {
-		if user.Conn == nil {
+	for _, user := range bridge.usersByPID {
+		if user.Pulse == nil {
 			continue
 		}
 		bridge.Log.Debugln("Disconnecting", user.MXID)
-		err := user.Conn.Disconnect()
-		if err != nil {
-			bridge.Log.Errorfln("Error while disconnecting %s: %v", user.MXID, err)
-		}
+		user.Pulse.Disconnect()
 	}
 }
 
@@ -429,8 +430,8 @@ func (bridge *Bridge) Main() {
 
 func main() {
 	flag.SetHelpTitles(
-		"mautrix-whatsapp - A Matrix-WhatsApp puppeting bridge.",
-		"mautrix-whatsapp [-h] [-c <path>] [-r <path>] [-g] [--migrate-db <source type> <source uri>]")
+		"mautrix-pulsesms - A Matrix-PulseSMS puppeting bridge.",
+		"mautrix-pulsesms [-h] [-c <path>] [-r <path>] [-g] [--migrate-db <source type> <source uri>]")
 	err := flag.Parse()
 	if err != nil {
 		_, _ = fmt.Fprintln(os.Stderr, err)

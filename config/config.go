@@ -1,4 +1,4 @@
-// mautrix-whatsapp - A Matrix-WhatsApp puppeting bridge.
+// mautrix-pulsesms - A Matrix-WhatsApp puppeting bridge.
 // Copyright (C) 2019 Tulir Asokan
 //
 // This program is free software: you can redistribute it and/or modify
@@ -92,7 +92,7 @@ func (config *Config) CanDoublePuppet(userID id.UserID) bool {
 func (config *Config) setDefaults() {
 	config.AppService.Database.MaxOpenConns = 20
 	config.AppService.Database.MaxIdleConns = 2
-	config.WhatsApp.OSName = "Mautrix-WhatsApp bridge"
+	config.WhatsApp.OSName = "Mautrix-Pulsesms bridge"
 	config.WhatsApp.BrowserName = "mx-wa"
 	config.Bridge.setDefaults()
 }

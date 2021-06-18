@@ -1,4 +1,5 @@
-// mautrix-whatsapp - A Matrix-WhatsApp puppeting bridge.
+// matrix-pulsesms - A Matrix-PulseSMS puppeting bridge.
+// Copyright (C) 2021 Cam Sweeney
 // Copyright (C) 2020 Tulir Asokan
 //
 // This program is free software: you can redistribute it and/or modify
@@ -17,13 +18,10 @@
 package main
 
 import (
-	"context"
-	"errors"
 	"net/http"
 	"sync/atomic"
 	"time"
 
-	"github.com/Rhymen/go-whatsapp"
 	"maunium.net/go/mautrix/id"
 )
 
@@ -74,23 +72,10 @@ func (pong *AsmuxPong) shouldDeduplicate(newPong *AsmuxPong) bool {
 	return pong.Timestamp+int64(pong.TTL/5) > time.Now().Unix()
 }
 
+// TODO
 func (user *User) setupAdminTestHooks() {
 	if !user.bridge.Config.Homeserver.Asmux {
 		return
-	}
-	user.Conn.AdminTestHook = func(err error) {
-		if errors.Is(err, whatsapp.ErrConnectionTimeout) {
-			user.sendBridgeStatus(AsmuxPong{Error: AsmuxWATimeout})
-		} else if errors.Is(err, whatsapp.ErrPingFalse) {
-			user.sendBridgeStatus(AsmuxPong{Error: AsmuxWAPingFalse})
-		} else if err == nil {
-			user.sendBridgeStatus(AsmuxPong{OK: true})
-		} else {
-			user.sendBridgeStatus(AsmuxPong{Error: AsmuxWAPingError})
-		}
-	}
-	user.Conn.CountTimeoutHook = func() {
-		user.sendBridgeStatus(AsmuxPong{Error: AsmuxWATimeout})
 	}
 }
 
@@ -122,38 +107,39 @@ func (prov *ProvisioningAPI) AsmuxPing(w http.ResponseWriter, r *http.Request) {
 	userID := r.URL.Query().Get("user_id")
 	user := prov.bridge.GetUserByMXID(id.UserID(userID))
 	var resp AsmuxPong
-	if user.Conn == nil {
+	if user.Pulse == nil {
 		if user.Session == nil {
 			resp.Error = AsmuxWANotLoggedIn
 		} else {
 			resp.Error = AsmuxWANotConnected
 		}
 	} else {
-		if user.Conn.IsConnected() && user.Conn.IsLoggedIn() {
+		if user.Pulse.IsConnected() {
 			pingID := atomic.AddUint32(&asmuxPingID, 1)
 			user.log.Debugfln("Pinging WhatsApp mobile due to asmux /ping API request (ID %d)", pingID)
-			err := user.Conn.AdminTestWithSuppress(true)
-			if errors.Is(r.Context().Err(), context.Canceled) {
-				user.log.Warnfln("Ping request %d was canceled before we responded (response was %v)", pingID, err)
-				user.prevBridgeStatus = nil
-				return
-			}
-			user.log.Debugfln("Ping %d response: %v", pingID, err)
-			if err == whatsapp.ErrPingFalse {
-				user.log.Debugln("Forwarding ping false error from provisioning API to HandleError")
-				go user.HandleError(err)
-				resp.Error = AsmuxWAPingFalse
-			} else if errors.Is(err, whatsapp.ErrConnectionTimeout) {
-				resp.Error = AsmuxWATimeout
-			} else if err != nil {
-				resp.Error = AsmuxWAPingError
-			} else {
-				resp.OK = true
-			}
-		} else if user.Conn.IsLoginInProgress() {
-			resp.Error = AsmuxWAConnecting
-		} else if user.Conn.IsConnected() {
-			resp.Error = AsmuxWANotLoggedIn
+			// err := user.Conn.AdminTestWithSuppress(true)
+			// if errors.Is(r.Context().Err(), context.Canceled) {
+			// 	user.log.Warnfln("Ping request %d was canceled before we responded (response was %v)", pingID, err)
+			// 	user.prevBridgeStatus = nil
+			// 	return
+			// }
+			resp.OK = true
+			// user.log.Debugfln("Ping %d response: %v", pingID, err)
+			// if err == whatsapp.ErrPingFalse {
+			// 	user.log.Debugln("Forwarding ping false error from provisioning API to HandleError")
+			// 	go user.HandleError(err)
+			// 	resp.Error = AsmuxWAPingFalse
+			// } else if errors.Is(err, whatsapp.ErrConnectionTimeout) {
+			// 	resp.Error = AsmuxWATimeout
+			// } else if err != nil {
+			// 	resp.Error = AsmuxWAPingError
+			// } else {
+			// 	resp.OK = true
+			// }
+			// } else if user.Conn.IsLoginInProgress() {
+			// 	resp.Error = AsmuxWAConnecting
+			// } else if user.Conn.IsConnected() {
+			// 	resp.Error = AsmuxWANotLoggedIn
 		} else {
 			resp.Error = AsmuxWANotConnected
 		}

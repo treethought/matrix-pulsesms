@@ -1,4 +1,4 @@
-// mautrix-whatsapp - A Matrix-WhatsApp puppeting bridge.
+// mautrix-pulsesms - A Matrix-WhatsApp puppeting bridge.
 // Copyright (C) 2019 Tulir Asokan
 //
 // This program is free software: you can redistribute it and/or modify
@@ -20,6 +20,7 @@ import (
 	"fmt"
 	"regexp"
 
+	"github.com/sirupsen/logrus"
 	"maunium.net/go/mautrix/appservice"
 )
 
@@ -35,8 +36,10 @@ func (config *Config) NewRegistration() (*appservice.Registration, error) {
 	config.AppService.HSToken = registration.ServerToken
 
 	// Workaround for https://github.com/matrix-org/synapse/pull/5758
-	registration.SenderLocalpart = appservice.RandomString(32)
+	// registration.SenderLocalpart = appservice.RandomString(32)
+	registration.SenderLocalpart = config.AppService.Bot.Username
 	botRegex := regexp.MustCompile(fmt.Sprintf("^@%s:%s$", config.AppService.Bot.Username, config.Homeserver.Domain))
+    logrus.Error(botRegex.String())
 	registration.Namespaces.RegisterUserIDs(botRegex, true)
 
 	return registration, nil

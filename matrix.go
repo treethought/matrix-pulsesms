@@ -1,4 +1,5 @@
-// mautrix-whatsapp - A Matrix-WhatsApp puppeting bridge.
+// matrix-pulsesms - A Matrix-PulseSMS puppeting bridge.
+// Copyright (C) 2021 Cam Sweeney
 // Copyright (C) 2020 Tulir Asokan
 //
 // This program is free software: you can redistribute it and/or modify
@@ -30,7 +31,7 @@ import (
 	"maunium.net/go/mautrix/format"
 	"maunium.net/go/mautrix/id"
 
-	"maunium.net/go/mautrix-whatsapp/database"
+	"github.com/treethought/matrix-pulsesms/database"
 )
 
 type MatrixHandler struct {
@@ -41,6 +42,7 @@ type MatrixHandler struct {
 }
 
 func NewMatrixHandler(bridge *Bridge) *MatrixHandler {
+	bridge.Log.Warn("creating matrix handler")
 	handler := &MatrixHandler{
 		bridge: bridge,
 		as:     bridge.AS,
@@ -142,7 +144,7 @@ func (mx *MatrixHandler) HandleBotInvite(evt *event.Event) {
 }
 
 func (mx *MatrixHandler) handlePrivatePortal(roomID id.RoomID, inviter *User, puppet *Puppet, key database.PortalKey) {
-	portal := mx.bridge.GetPortalByJID(key)
+	portal := mx.bridge.GetPortalByPID(key)
 
 	if len(portal.MXID) == 0 {
 		mx.createPrivatePortalFromInvite(roomID, inviter, puppet, portal)
@@ -151,7 +153,7 @@ func (mx *MatrixHandler) handlePrivatePortal(roomID id.RoomID, inviter *User, pu
 
 	err := portal.MainIntent().EnsureInvited(portal.MXID, inviter.MXID)
 	if err != nil {
-		mx.log.Warnfln("Failed to invite %s to existing private chat portal %s with %s: %v. Redirecting portal to new room...", inviter.MXID, portal.MXID, puppet.JID, err)
+		mx.log.Warnfln("Failed to invite %s to existing private chat portal %s with %s: %v. Redirecting portal to new room...", inviter.MXID, portal.MXID, puppet.PID, err)
 		mx.createPrivatePortalFromInvite(roomID, inviter, puppet, portal)
 		return
 	}
@@ -206,8 +208,9 @@ func (mx *MatrixHandler) createPrivatePortalFromInvite(roomID id.RoomID, inviter
 		portal.log.Errorln("Failed to fill history:", err)
 	}
 
-	inviter.addPortalToCommunity(portal)
-	inviter.addPuppetToCommunity(puppet)
+	// inviter.addPortalToCommunity(portal)
+	inviter.addPortalToSpace(portal)
+	inviter.addPuppetToSpace(puppet)
 }
 
 func (mx *MatrixHandler) HandlePuppetInvite(evt *event.Event, inviter *User, puppet *Puppet) {
@@ -227,7 +230,7 @@ func (mx *MatrixHandler) HandlePuppetInvite(evt *event.Event, inviter *User, pup
 		}
 	}
 	if !hasBridgeBot && !hasOtherUsers {
-		key := database.NewPortalKey(puppet.JID, inviter.JID)
+		key := database.NewPortalKey(puppet.PID, inviter.PID)
 		mx.handlePrivatePortal(evt.RoomID, inviter, puppet, key)
 	} else if !hasBridgeBot {
 		mx.log.Debugln("Leaving multi-user room", evt.RoomID, "as", puppet.MXID, "after accepting invite from", evt.Sender)
@@ -239,6 +242,7 @@ func (mx *MatrixHandler) HandlePuppetInvite(evt *event.Event, inviter *User, pup
 }
 
 func (mx *MatrixHandler) HandleMembership(evt *event.Event) {
+	mx.log.Info("Handling membership")
 	if _, isPuppet := mx.bridge.ParsePuppetMXID(evt.Sender); evt.Sender == mx.bridge.Bot.UserID || isPuppet {
 		return
 	}
@@ -316,7 +320,7 @@ func (mx *MatrixHandler) shouldIgnoreEvent(evt *event.Event) bool {
 	if _, isPuppet := mx.bridge.ParsePuppetMXID(evt.Sender); evt.Sender == mx.bridge.Bot.UserID || isPuppet {
 		return true
 	}
-	isCustomPuppet, ok := evt.Content.Raw["net.maunium.whatsapp.puppet"].(bool)
+	isCustomPuppet, ok := evt.Content.Raw["dev.spherics.pulsesms.puppet"].(bool)
 	if ok && isCustomPuppet && mx.bridge.GetPuppetByCustomMXID(evt.Sender) != nil {
 		return true
 	}

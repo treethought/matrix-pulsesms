@@ -11,16 +11,16 @@ func init() {
 			return nil
 		}
 		res, _ := ctx.db.Query(`SELECT EXISTS(SELECT constraint_name FROM information_schema.table_constraints
-			WHERE table_name='message' AND constraint_name='message_chat_jid_fkey')`)
+			WHERE table_name='message' AND constraint_name='message_chat_pid_fkey')`)
 		var exists bool
 		_ = res.Scan(&exists)
 		if exists {
-			_, err := tx.Exec("ALTER TABLE message DROP CONSTRAINT IF EXISTS message_chat_jid_fkey")
+			_, err := tx.Exec("ALTER TABLE message DROP CONSTRAINT IF EXISTS message_chat_pid_fkey")
 			if err != nil {
 				return err
 			}
-			_, err = tx.Exec(`ALTER TABLE message ADD CONSTRAINT message_chat_jid_fkey
-				FOREIGN KEY (chat_jid, chat_receiver) REFERENCES portal(jid, receiver)
+			_, err = tx.Exec(`ALTER TABLE message ADD CONSTRAINT message_chat_pid_fkey
+				FOREIGN KEY (chat_pid, chat_receiver) REFERENCES portal(pid, receiver)
 				ON DELETE CASCADE`)
 			if err != nil {
 				return err

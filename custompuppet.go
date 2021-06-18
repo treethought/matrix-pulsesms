@@ -1,4 +1,5 @@
-// mautrix-whatsapp - A Matrix-WhatsApp puppeting bridge.
+// matrix-pulsesms - A Matrix-PulseSMS puppeting bridge.
+// Copyright (C) 2021 Cam Sweeney
 // Copyright (C) 2020 Tulir Asokan
 //
 // This program is free software: you can redistribute it and/or modify
@@ -22,8 +23,6 @@ import (
 	"encoding/hex"
 	"errors"
 	"time"
-
-	"github.com/Rhymen/go-whatsapp"
 
 	"maunium.net/go/mautrix"
 	"maunium.net/go/mautrix/appservice"
@@ -166,7 +165,7 @@ func (puppet *Puppet) ProcessResponse(resp *mautrix.RespSync, _ string) error {
 	}
 	for roomID, events := range resp.Rooms.Join {
 		portal := puppet.bridge.GetPortalByMXID(roomID)
-		if portal == nil || portal.IsBroadcastList() {
+		if portal == nil {
 			continue
 		}
 		for _, evt := range events.Ephemeral.Events {
@@ -175,12 +174,12 @@ func (puppet *Puppet) ProcessResponse(resp *mautrix.RespSync, _ string) error {
 				continue
 			}
 			switch evt.Type {
-			case event.EphemeralEventReceipt:
-				if puppet.EnableReceipts {
-					go puppet.handleReceiptEvent(portal, evt)
-				}
-			case event.EphemeralEventTyping:
-				go puppet.handleTypingEvent(portal, evt)
+			// case event.EphemeralEventReceipt:
+			// 	if puppet.EnableReceipts {
+			// 		go puppet.handleReceiptEvent(portal, evt)
+			// 	}
+			// case event.EphemeralEventTyping:
+			// 	go puppet.handleTypingEvent(portal, evt)
 			}
 		}
 	}
@@ -200,59 +199,48 @@ func (puppet *Puppet) ProcessResponse(resp *mautrix.RespSync, _ string) error {
 }
 
 func (puppet *Puppet) handlePresenceEvent(event *event.Event) {
-	presence := whatsapp.PresenceAvailable
-	if event.Content.Raw["presence"].(string) != "online" {
-		presence = whatsapp.PresenceUnavailable
-		puppet.customUser.log.Debugln("Marking offline")
-	} else {
-		puppet.customUser.log.Debugln("Marking online")
-	}
-	_, err := puppet.customUser.Conn.Presence("", presence)
-	if err != nil {
-		puppet.customUser.log.Warnln("Failed to set presence:", err)
-	}
 }
 
-func (puppet *Puppet) handleReceiptEvent(portal *Portal, event *event.Event) {
-	for eventID, receipts := range *event.Content.AsReceipt() {
-		if receipt, ok := receipts.Read[puppet.CustomMXID]; !ok {
-			// Ignore receipt events where this user isn't present.
-		} else if isDoublePuppeted, _ := receipt.Extra["net.maunium.whatsapp.puppet"].(bool); isDoublePuppeted {
-			puppet.customUser.log.Debugfln("Ignoring double puppeted read receipt %+v", event.Content.Raw)
-			// Ignore double puppeted read receipts.
-		} else if message := puppet.bridge.DB.Message.GetByMXID(eventID); message != nil {
-			puppet.customUser.log.Debugfln("Marking %s/%s in %s/%s as read", message.JID, message.MXID, portal.Key.JID, portal.MXID)
-			_, err := puppet.customUser.Conn.Read(portal.Key.JID, message.JID)
-			if err != nil {
-				puppet.customUser.log.Warnln("Error marking read:", err)
-			}
-		}
-	}
-}
+// func (puppet *Puppet) handleReceiptEvent(portal *Portal, event *event.Event) {
+// 	for eventID, receipts := range *event.Content.AsReceipt() {
+// 		if receipt, ok := receipts.Read[puppet.CustomMXID]; !ok {
+// 			// Ignore receipt events where this user isn't present.
+// 		} else if isDoublePuppeted, _ := receipt.Extra["net.maunium.whatsapp.puppet"].(bool); isDoublePuppeted {
+// 			puppet.customUser.log.Debugfln("Ignoring double puppeted read receipt %+v", event.Content.Raw)
+// 			// Ignore double puppeted read receipts.
+// 		} else if message := puppet.bridge.DB.Message.GetByMXID(eventID); message != nil {
+// 			puppet.customUser.log.Debugfln("Marking %s/%s in %s/%s as read", message.ID, message.MXID, portal.Key.PID, portal.MXID)
+// 			_, err := puppet.customUser.Conn.Read(portal.Key.PID, message.ID)
+// 			if err != nil {
+// 				puppet.customUser.log.Warnln("Error marking read:", err)
+// 			}
+// 		}
+// 	}
+// }
 
-func (puppet *Puppet) handleTypingEvent(portal *Portal, evt *event.Event) {
-	isTyping := false
-	for _, userID := range evt.Content.AsTyping().UserIDs {
-		if userID == puppet.CustomMXID {
-			isTyping = true
-			break
-		}
-	}
-	if puppet.customTypingIn[evt.RoomID] != isTyping {
-		puppet.customTypingIn[evt.RoomID] = isTyping
-		presence := whatsapp.PresenceComposing
-		if !isTyping {
-			puppet.customUser.log.Debugfln("Marking not typing in %s/%s", portal.Key.JID, portal.MXID)
-			presence = whatsapp.PresencePaused
-		} else {
-			puppet.customUser.log.Debugfln("Marking typing in %s/%s", portal.Key.JID, portal.MXID)
-		}
-		_, err := puppet.customUser.Conn.Presence(portal.Key.JID, presence)
-		if err != nil {
-			puppet.customUser.log.Warnln("Error setting typing:", err)
-		}
-	}
-}
+// func (puppet *Puppet) handleTypingEvent(portal *Portal, evt *event.Event) {
+// 	isTyping := false
+// 	for _, userID := range evt.Content.AsTyping().UserIDs {
+// 		if userID == puppet.CustomMXID {
+// 			isTyping = true
+// 			break
+// 		}
+// 	}
+// if puppet.customTypingIn[evt.RoomID] != isTyping {
+// 	puppet.customTypingIn[evt.RoomID] = isTyping
+// 	presence := whatsapp.PresenceComposing
+// 	if !isTyping {
+// 		puppet.customUser.log.Debugfln("Marking not typing in %s/%s", portal.Key.PID, portal.MXID)
+// 		presence = whatsapp.PresencePaused
+// 	} else {
+// 		puppet.customUser.log.Debugfln("Marking typing in %s/%s", portal.Key.PID, portal.MXID)
+// 	}
+// 	_, err := puppet.customUser.Conn.Presence(portal.Key.PID, presence)
+// 	if err != nil {
+// 		puppet.customUser.log.Warnln("Error setting typing:", err)
+// 	}
+// }
+// }
 
 func (puppet *Puppet) tryRelogin(cause error, action string) bool {
 	if !puppet.bridge.Config.CanDoublePuppet(puppet.CustomMXID) {

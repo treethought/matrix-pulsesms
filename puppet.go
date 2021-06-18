@@ -1,4 +1,5 @@
-// mautrix-whatsapp - A Matrix-WhatsApp puppeting bridge.
+// matrix-pulsesms - A Matrix-PulseSMS puppeting bridge.
+// Copyright (C) 2021 Cam Sweeney
 // Copyright (C) 2020 Tulir Asokan
 //
 // This program is free software: you can redistribute it and/or modify
@@ -18,26 +19,24 @@ package main
 
 import (
 	"fmt"
-	"net/http"
 	"regexp"
-	"strings"
 	"sync"
-
-	"github.com/Rhymen/go-whatsapp"
 
 	log "maunium.net/go/maulogger/v2"
 	"maunium.net/go/mautrix/appservice"
 	"maunium.net/go/mautrix/id"
 
-	"maunium.net/go/mautrix-whatsapp/database"
+	"github.com/treethought/matrix-pulsesms/database"
+	"github.com/treethought/pulsesms"
 )
 
 var userIDRegex *regexp.Regexp
 
-func (bridge *Bridge) ParsePuppetMXID(mxid id.UserID) (whatsapp.JID, bool) {
+func (bridge *Bridge) ParsePuppetMXID(mxid id.UserID) (pulsesms.PhoneNumber, bool) {
 	if userIDRegex == nil {
 		userIDRegex = regexp.MustCompile(fmt.Sprintf("^@%s:%s$",
-			bridge.Config.Bridge.FormatUsername("([0-9]+)"),
+			// bridge.Config.Bridge.FormatUsername("([0-9]+)"),
+			bridge.Config.Bridge.FormatUsername("[^a-zA-Z0-9]+"),
 			bridge.Config.Homeserver.Domain))
 	}
 	match := userIDRegex.FindStringSubmatch(string(mxid))
@@ -45,32 +44,37 @@ func (bridge *Bridge) ParsePuppetMXID(mxid id.UserID) (whatsapp.JID, bool) {
 		return "", false
 	}
 
-	jid := whatsapp.JID(match[1] + whatsapp.NewUserSuffix)
-	return jid, true
+	// pid := pulsesms.ChatID(match[1] + whatsapp.NewUserSuffix)
+	pid := pulsesms.ChatID(match[1])
+	bridge.Log.Debugfln("parsed puppet mxid %s", pid)
+	return pid, true
 }
 
 func (bridge *Bridge) GetPuppetByMXID(mxid id.UserID) *Puppet {
-	jid, ok := bridge.ParsePuppetMXID(mxid)
+	pid, ok := bridge.ParsePuppetMXID(mxid)
 	if !ok {
 		return nil
 	}
 
-	return bridge.GetPuppetByJID(jid)
+	return bridge.GetPuppetByPID(pid)
 }
 
-func (bridge *Bridge) GetPuppetByJID(jid whatsapp.JID) *Puppet {
+func (bridge *Bridge) GetPuppetByPID(pid pulsesms.PhoneNumber) *Puppet {
+	bridge.Log.Debugfln("getting puppet by pid: %s", pid)
 	bridge.puppetsLock.Lock()
 	defer bridge.puppetsLock.Unlock()
-	puppet, ok := bridge.puppets[jid]
+	puppet, ok := bridge.puppets[pid]
 	if !ok {
-		dbPuppet := bridge.DB.Puppet.Get(jid)
+
+		bridge.Log.Infofln("puppet by pid %s does not exist, creating", pid)
+		dbPuppet := bridge.DB.Puppet.Get(pid)
 		if dbPuppet == nil {
 			dbPuppet = bridge.DB.Puppet.New()
-			dbPuppet.JID = jid
+			dbPuppet.PID = pid
 			dbPuppet.Insert()
 		}
 		puppet = bridge.NewPuppet(dbPuppet)
-		bridge.puppets[puppet.JID] = puppet
+		bridge.puppets[puppet.PID] = puppet
 		if len(puppet.CustomMXID) > 0 {
 			bridge.puppetsByCustomMXID[puppet.CustomMXID] = puppet
 		}
@@ -88,7 +92,7 @@ func (bridge *Bridge) GetPuppetByCustomMXID(mxid id.UserID) *Puppet {
 			return nil
 		}
 		puppet = bridge.NewPuppet(dbPuppet)
-		bridge.puppets[puppet.JID] = puppet
+		bridge.puppets[puppet.PID] = puppet
 		bridge.puppetsByCustomMXID[puppet.CustomMXID] = puppet
 	}
 	return puppet
@@ -110,10 +114,10 @@ func (bridge *Bridge) dbPuppetsToPuppets(dbPuppets []*database.Puppet) []*Puppet
 		if dbPuppet == nil {
 			continue
 		}
-		puppet, ok := bridge.puppets[dbPuppet.JID]
+		puppet, ok := bridge.puppets[dbPuppet.PID]
 		if !ok {
 			puppet = bridge.NewPuppet(dbPuppet)
-			bridge.puppets[dbPuppet.JID] = puppet
+			bridge.puppets[dbPuppet.PID] = puppet
 			if len(dbPuppet.CustomMXID) > 0 {
 				bridge.puppetsByCustomMXID[dbPuppet.CustomMXID] = puppet
 			}
@@ -123,12 +127,15 @@ func (bridge *Bridge) dbPuppetsToPuppets(dbPuppets []*database.Puppet) []*Puppet
 	return output
 }
 
-func (bridge *Bridge) FormatPuppetMXID(jid whatsapp.JID) id.UserID {
+func (bridge *Bridge) FormatPuppetMXID(pid pulsesms.PhoneNumber) id.UserID {
+	bridge.Log.Debugfln("Formatting puppet mxid for :%s", pid)
+	reg, err := regexp.Compile("[^a-zA-Z0-9]+")
+	if err != nil {
+		log.Fatal(err)
+	}
+	cleanID := reg.ReplaceAllString(pid, "")
 	return id.NewUserID(
-		bridge.Config.Bridge.FormatUsername(
-			strings.Replace(
-				jid,
-				whatsapp.NewUserSuffix, "", 1)),
+		bridge.Config.Bridge.FormatUsername(cleanID),
 		bridge.Config.Homeserver.Domain)
 }
 
@@ -136,9 +143,9 @@ func (bridge *Bridge) NewPuppet(dbPuppet *database.Puppet) *Puppet {
 	return &Puppet{
 		Puppet: dbPuppet,
 		bridge: bridge,
-		log:    bridge.Log.Sub(fmt.Sprintf("Puppet/%s", dbPuppet.JID)),
+		log:    bridge.Log.Sub(fmt.Sprintf("Puppet/%s", dbPuppet.PID)),
 
-		MXID: bridge.FormatPuppetMXID(dbPuppet.JID),
+		MXID: bridge.FormatPuppetMXID(dbPuppet.PID),
 	}
 }
 
@@ -161,13 +168,13 @@ type Puppet struct {
 }
 
 func (puppet *Puppet) PhoneNumber() string {
-	return strings.Replace(puppet.JID, whatsapp.NewUserSuffix, "", 1)
+    return puppet.PID
 }
 
 func (puppet *Puppet) IntentFor(portal *Portal) *appservice.IntentAPI {
 	if (!portal.IsPrivateChat() && puppet.customIntent == nil) ||
 		(portal.backfilling && portal.bridge.Config.Bridge.InviteOwnPuppetForBackfilling) ||
-		portal.Key.JID == puppet.JID {
+		portal.Key.PID == puppet.PID {
 		return puppet.DefaultIntent()
 	}
 	return puppet.customIntent
@@ -181,62 +188,63 @@ func (puppet *Puppet) DefaultIntent() *appservice.IntentAPI {
 	return puppet.bridge.AS.Intent(puppet.MXID)
 }
 
-func (puppet *Puppet) UpdateAvatar(source *User, avatar *whatsapp.ProfilePicInfo) bool {
-	if avatar == nil {
-		var err error
-		avatar, err = source.Conn.GetProfilePicThumb(puppet.JID)
-		if err != nil {
-			puppet.log.Warnln("Failed to get avatar:", err)
-			return false
-		}
-	}
+func (puppet *Puppet) UpdateAvatar(source *User, avatar *profilePicInfo) bool {
+	return false
+	// if avatar == nil {
+	// 	var err error
+	// 	avatar, err = source.Pulse.GetProfilePicThumb(puppet.PID)
+	// 	if err != nil {
+	// 		puppet.log.Warnln("Failed to get avatar:", err)
+	// 		return false
+	// 	}
+	// }
 
-	if avatar.Status == 404 {
-		avatar.Tag = "remove"
-		avatar.Status = 0
-	} else if avatar.Status == 401 && puppet.Avatar != "unauthorized" {
-		puppet.Avatar = "unauthorized"
-		return true
-	}
-	if avatar.Status != 0 || avatar.Tag == puppet.Avatar {
-		return false
-	}
+	// if avatar.Status == 404 {
+	// 	avatar.Tag = "remove"
+	// 	avatar.Status = 0
+	// } else if avatar.Status == 401 && puppet.Avatar != "unauthorized" {
+	// 	puppet.Avatar = "unauthorized"
+	// 	return true
+	// }
+	// if avatar.Status != 0 || avatar.Tag == puppet.Avatar {
+	// 	return false
+	// }
 
-	if avatar.Tag == "remove" || len(avatar.URL) == 0 {
-		err := puppet.DefaultIntent().SetAvatarURL(id.ContentURI{})
-		if err != nil {
-			puppet.log.Warnln("Failed to remove avatar:", err)
-		}
-		puppet.AvatarURL = id.ContentURI{}
-		puppet.Avatar = avatar.Tag
-		go puppet.updatePortalAvatar()
-		return true
-	}
+	// if avatar.Tag == "remove" || len(avatar.URL) == 0 {
+	// 	err := puppet.DefaultIntent().SetAvatarURL(id.ContentURI{})
+	// 	if err != nil {
+	// 		puppet.log.Warnln("Failed to remove avatar:", err)
+	// 	}
+	// 	puppet.AvatarURL = id.ContentURI{}
+	// 	puppet.Avatar = avatar.Tag
+	// 	go puppet.updatePortalAvatar()
+	// 	return true
+	// }
 
-	data, err := avatar.DownloadBytes()
-	if err != nil {
-		puppet.log.Warnln("Failed to download avatar:", err)
-		return false
-	}
+	// data, err := avatar.DownloadBytes()
+	// if err != nil {
+	// 	puppet.log.Warnln("Failed to download avatar:", err)
+	// 	return false
+	// }
 
-	mime := http.DetectContentType(data)
-	resp, err := puppet.DefaultIntent().UploadBytes(data, mime)
-	if err != nil {
-		puppet.log.Warnln("Failed to upload avatar:", err)
-		return false
-	}
+	// mime := http.DetectContentType(data)
+	// resp, err := puppet.DefaultIntent().UploadBytes(data, mime)
+	// if err != nil {
+	// 	puppet.log.Warnln("Failed to upload avatar:", err)
+	// 	return false
+	// }
 
-	puppet.AvatarURL = resp.ContentURI
-	err = puppet.DefaultIntent().SetAvatarURL(puppet.AvatarURL)
-	if err != nil {
-		puppet.log.Warnln("Failed to set avatar:", err)
-	}
-	puppet.Avatar = avatar.Tag
-	go puppet.updatePortalAvatar()
-	return true
+	// puppet.AvatarURL = resp.ContentURI
+	// err = puppet.DefaultIntent().SetAvatarURL(puppet.AvatarURL)
+	// if err != nil {
+	// 	puppet.log.Warnln("Failed to set avatar:", err)
+	// }
+	// puppet.Avatar = avatar.Tag
+	// go puppet.updatePortalAvatar()
+	// return true
 }
 
-func (puppet *Puppet) UpdateName(source *User, contact whatsapp.Contact) bool {
+func (puppet *Puppet) UpdateName(source *User, contact pulsesms.Contact) bool {
 	newName, quality := puppet.bridge.Config.Bridge.FormatDisplayname(contact)
 	if puppet.Displayname != newName && quality >= puppet.NameQuality {
 		err := puppet.DefaultIntent().SetDisplayName(newName)
@@ -255,7 +263,7 @@ func (puppet *Puppet) UpdateName(source *User, contact whatsapp.Contact) bool {
 
 func (puppet *Puppet) updatePortalMeta(meta func(portal *Portal)) {
 	if puppet.bridge.Config.Bridge.PrivateChatPortalMeta {
-		for _, portal := range puppet.bridge.GetAllPortalsByJID(puppet.JID) {
+		for _, portal := range puppet.bridge.GetAllPortalsByPID(puppet.PID) {
 			meta(portal)
 		}
 	}
@@ -292,19 +300,19 @@ func (puppet *Puppet) SyncContactIfNecessary(source *User) {
 	if len(puppet.Displayname) > 0 {
 		return
 	}
-
-	contact, ok := source.Conn.Store.Contacts[puppet.JID]
+	contact, ok := source.Pulse.Store.Contacts[puppet.PID]
 	if !ok {
 		puppet.log.Warnfln("No contact info found through %s in SyncContactIfNecessary", source.MXID)
-		contact.JID = puppet.JID
+		contact.PhoneNumber = puppet.PID
 		// Sync anyway to set a phone number name
 	} else {
-		puppet.log.Debugfln("Syncing contact info through %s / %s because puppet has no displayname", source.MXID, source.JID)
+		puppet.log.Debugfln("Syncing contact info through %s / %s because puppet has no displayname", source.MXID, source.PID)
 	}
 	puppet.Sync(source, contact)
 }
 
-func (puppet *Puppet) Sync(source *User, contact whatsapp.Contact) {
+func (puppet *Puppet) Sync(source *User, contact pulsesms.Contact) {
+	puppet.log.Infofln("syncing puppet %s", contact.Name)
 	puppet.syncLock.Lock()
 	defer puppet.syncLock.Unlock()
 	err := puppet.DefaultIntent().EnsureRegistered()
@@ -312,9 +320,9 @@ func (puppet *Puppet) Sync(source *User, contact whatsapp.Contact) {
 		puppet.log.Errorln("Failed to ensure registered:", err)
 	}
 
-	if contact.JID == source.JID {
-		contact.Notify = source.pushName
-	}
+	// if contact.PID == source.PID {
+	// 	contact.Notify = source.pushName
+	// }
 
 	update := false
 	update = puppet.UpdateName(source, contact) || update

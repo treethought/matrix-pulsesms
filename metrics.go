@@ -1,4 +1,5 @@
-// mautrix-whatsapp - A Matrix-WhatsApp puppeting bridge.
+// matrix-pulsesms - A Matrix-PulseSMS puppeting bridge.
+// Copyright (C) 2021 Cam Sweeney
 // Copyright (C) 2020 Tulir Asokan
 //
 // This program is free software: you can redistribute it and/or modify
@@ -27,12 +28,11 @@ import (
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	log "maunium.net/go/maulogger/v2"
 
-	"github.com/Rhymen/go-whatsapp"
-
 	"maunium.net/go/mautrix/event"
 	"maunium.net/go/mautrix/id"
 
-	"maunium.net/go/mautrix-whatsapp/database"
+	"github.com/treethought/matrix-pulsesms/database"
+	"github.com/treethought/pulsesms"
 )
 
 type MetricsHandler struct {
@@ -57,17 +57,17 @@ type MetricsHandler struct {
 	unencryptedPrivateCount prometheus.Gauge
 
 	connected       prometheus.Gauge
-	connectedState  map[whatsapp.JID]bool
+	connectedState  map[pulsesms.PhoneNumber]bool
 	loggedIn        prometheus.Gauge
-	loggedInState   map[whatsapp.JID]bool
+	loggedInState   map[pulsesms.PhoneNumber]bool
 	syncLocked      prometheus.Gauge
-	syncLockedState map[whatsapp.JID]bool
+	syncLockedState map[pulsesms.PhoneNumber]bool
 	bufferLength    *prometheus.GaugeVec
 }
 
 func NewMetricsHandler(address string, log log.Logger, db *database.Database) *MetricsHandler {
 	portalCount := promauto.NewGaugeVec(prometheus.GaugeOpts{
-		Name: "whatsapp_portals_total",
+		Name: "pulsesms_portals_total",
 		Help: "Number of portal rooms on Matrix",
 	}, []string{"type", "encrypted"})
 	return &MetricsHandler{
@@ -81,23 +81,23 @@ func NewMetricsHandler(address string, log log.Logger, db *database.Database) *M
 			Help: "Time spent processing Matrix events",
 		}, []string{"event_type"}),
 		countCollection: promauto.NewHistogram(prometheus.HistogramOpts{
-			Name: "whatsapp_count_collection",
-			Help: "Time spent collecting the whatsapp_*_total metrics",
+			Name: "pulsesms_count_collection",
+			Help: "Time spent collecting the pulsesms_*_total metrics",
 		}),
 		disconnections: promauto.NewCounterVec(prometheus.CounterOpts{
-			Name: "whatsapp_disconnections",
-			Help: "Number of times a Matrix user has been disconnected from WhatsApp",
+			Name: "pulsesms_disconnections",
+			Help: "Number of times a Matrix user has been disconnected from PulseSMS",
 		}, []string{"user_id"}),
 		puppetCount: promauto.NewGauge(prometheus.GaugeOpts{
-			Name: "whatsapp_puppets_total",
-			Help: "Number of WhatsApp users bridged into Matrix",
+			Name: "pulsesms_puppets_total",
+			Help: "Number of PulseSMS users bridged into Matrix",
 		}),
 		userCount: promauto.NewGauge(prometheus.GaugeOpts{
-			Name: "whatsapp_users_total",
+			Name: "pulsesms_users_total",
 			Help: "Number of Matrix users using the bridge",
 		}),
 		messageCount: promauto.NewGauge(prometheus.GaugeOpts{
-			Name: "whatsapp_messages_total",
+			Name: "pulsesms_messages_total",
 			Help: "Number of messages bridged",
 		}),
 		portalCount:             portalCount,
@@ -110,17 +110,17 @@ func NewMetricsHandler(address string, log log.Logger, db *database.Database) *M
 			Name: "bridge_logged_in",
 			Help: "Users logged into the bridge",
 		}),
-		loggedInState: make(map[whatsapp.JID]bool),
+		loggedInState: make(map[pulsesms.PhoneNumber]bool),
 		connected: promauto.NewGauge(prometheus.GaugeOpts{
 			Name: "bridge_connected",
-			Help: "Bridge users connected to WhatsApp",
+			Help: "Bridge users connected to PulseSMS",
 		}),
-		connectedState: make(map[whatsapp.JID]bool),
+		connectedState: make(map[pulsesms.PhoneNumber]bool),
 		syncLocked: promauto.NewGauge(prometheus.GaugeOpts{
 			Name: "bridge_sync_locked",
 			Help: "Bridge users locked in post-login sync",
 		}),
-		syncLockedState: make(map[whatsapp.JID]bool),
+		syncLockedState: make(map[pulsesms.PhoneNumber]bool),
 		bufferLength: promauto.NewGaugeVec(prometheus.GaugeOpts{
 			Name: "bridge_buffer_size",
 			Help: "Number of messages in buffer",
@@ -150,7 +150,7 @@ func (mh *MetricsHandler) TrackDisconnection(userID id.UserID) {
 	mh.disconnections.With(prometheus.Labels{"user_id": string(userID)}).Inc()
 }
 
-func (mh *MetricsHandler) TrackLoginState(jid whatsapp.JID, loggedIn bool) {
+func (mh *MetricsHandler) TrackLoginState(jid pulsesms.PhoneNumber, loggedIn bool) {
 	if !mh.running {
 		return
 	}
@@ -165,7 +165,7 @@ func (mh *MetricsHandler) TrackLoginState(jid whatsapp.JID, loggedIn bool) {
 	}
 }
 
-func (mh *MetricsHandler) TrackConnectionState(jid whatsapp.JID, connected bool) {
+func (mh *MetricsHandler) TrackConnectionState(jid pulsesms.PhoneNumber, connected bool) {
 	if !mh.running {
 		return
 	}
@@ -180,7 +180,7 @@ func (mh *MetricsHandler) TrackConnectionState(jid whatsapp.JID, connected bool)
 	}
 }
 
-func (mh *MetricsHandler) TrackSyncLock(jid whatsapp.JID, locked bool) {
+func (mh *MetricsHandler) TrackSyncLock(jid pulsesms.PhoneNumber, locked bool) {
 	if !mh.running {
 		return
 	}
@@ -228,6 +228,7 @@ func (mh *MetricsHandler) updateStats() {
 		mh.messageCount.Set(float64(messageCount))
 	}
 
+    // TODO
 	var encryptedGroupCount, encryptedPrivateCount, unencryptedGroupCount, unencryptedPrivateCount int
 	err = mh.db.QueryRowContext(mh.ctx, `
 			SELECT

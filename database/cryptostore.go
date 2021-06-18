@@ -1,4 +1,4 @@
-// mautrix-whatsapp - A Matrix-WhatsApp puppeting bridge.
+// mautrix-pulsesms - A Matrix-WhatsApp puppeting bridge.
 // Copyright (C) 2020 Tulir Asokan
 //
 // This program is free software: you can redistribute it and/or modify
@@ -38,7 +38,7 @@ var _ crypto.Store = (*SQLCryptoStore)(nil)
 func NewSQLCryptoStore(db *Database, userID id.UserID, ghostIDFormat string) *SQLCryptoStore {
 	return &SQLCryptoStore{
 		SQLCryptoStore: crypto.NewSQLCryptoStore(db.DB, db.dialect, "", "",
-			[]byte("maunium.net/go/mautrix-whatsapp"),
+			[]byte("github.com/treethought/matrix-pulsesms"),
 			&cryptoLogger{db.log.Sub("CryptoStore")}),
 		UserID:        userID,
 		GhostIDFormat: ghostIDFormat,
