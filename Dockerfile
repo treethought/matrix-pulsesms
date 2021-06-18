@@ -19,15 +19,11 @@ ENV UID=1337 \
 
 RUN apk add --no-cache ffmpeg su-exec ca-certificates olm bash jq yq curl
 
-# COPY --from=builder /usr/bin/pulsesms /usr/bin/pulsesms
-
-
-
-COPY --from=builder /usr/bin/matrix-pulsesms /usr/bin/mautrix-pulsesms
+COPY --from=builder /usr/bin/matrix-pulsesms /usr/bin/matrix-pulsesms
 COPY --from=builder /build/example-config.yaml /opt/matrix-pulsesms/example-config.yaml
 COPY --from=builder /build/docker-run.sh /docker-run.sh
 VOLUME /data
 
-ENTRYPOINT ["/usr/bin/matrix-pulsesms"]
+# ENTRYPOINT ["/usr/bin/matrix-pulsesms"]
 
-# CMD ["/docker-run.sh"]
+CMD ["/docker-run.sh"]

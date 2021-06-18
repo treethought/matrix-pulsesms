@@ -11,7 +11,7 @@ Asokan. All credit for design and heavy lifting of this bridge belongs to him.
 While there are other options for bridging SMS
 [SmsMatrix](https://github.com/tijder/SmsMatrix) and [matrix-sms-bridge](https://github.com/benkuly/matrix-sms-bridge), they require either an SMS gateway server, or a dedicated app running alongside your sms app to work. 
 
-mautrix-pulsesms instead uses the cross-device syncing capability and API of
+matrix-pulsesms instead uses the cross-device syncing capability and API of
 PulseSMS and serves as a bridge by acting as pulse API client.
 
 While this has some benefits over the other bridges (no gateway needed, and no

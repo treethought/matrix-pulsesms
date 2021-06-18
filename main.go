@@ -430,8 +430,8 @@ func (bridge *Bridge) Main() {
 
 func main() {
 	flag.SetHelpTitles(
-		"mautrix-pulsesms - A Matrix-PulseSMS puppeting bridge.",
-		"mautrix-pulsesms [-h] [-c <path>] [-r <path>] [-g] [--migrate-db <source type> <source uri>]")
+		"matrix-pulsesms - A Matrix-PulseSMS puppeting bridge.",
+		"matrix-pulsesms [-h] [-c <path>] [-r <path>] [-g] [--migrate-db <source type> <source uri>]")
 	err := flag.Parse()
 	if err != nil {
 		_, _ = fmt.Fprintln(os.Stderr, err)

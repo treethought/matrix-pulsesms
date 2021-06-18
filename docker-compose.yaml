@@ -8,7 +8,6 @@ services:
       - synapse
     volumes:
       - ./bridge_data:/data # bridge yaml config
-      - ./bridge_config:/app # bridge yaml config
       - ./synapse_files:/synapse_files # need to generate registration into synapse config
     ports:
       - 29318:29318
