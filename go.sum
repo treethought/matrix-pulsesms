@@ -304,8 +304,6 @@ github.com/tidwall/pretty v1.0.2/go.mod h1:XNkn88O1ChpSDQmQeStsy+sBenx6DDtFZJxhV
 github.com/tidwall/sjson v1.1.5 h1:wsUceI/XDyZk3J1FUvuuYlK62zJv2HO2Pzb8A5EWdUE=
 github.com/tidwall/sjson v1.1.5/go.mod h1:VuJzsZnTowhSxWdOgsAnb886i4AjEyTkk7tNtsL7EYE=
 github.com/tmc/grpc-websocket-proxy v0.0.0-20170815181823-89b8d40f7ca8/go.mod h1:ncp9v5uamzpCO7NfCPTXjqaC+bZgJeR0sMTm6dMHP7U=
-github.com/treethought/pulsesms v0.0.10-0.20210616153223-13e3e720406e h1:ph7K4b27b1Ql3cW7BBi/Kxju0RB4bK5slqfy9JyOP4k=
-github.com/treethought/pulsesms v0.0.10-0.20210616153223-13e3e720406e/go.mod h1:7/9sXxltilKgADQpXsA/obzF63aSuV4M5PB01jy6zmE=
 github.com/treethought/pulsesms v0.0.10-0.20210617020847-034b8d0a7a77 h1:+YrejxVVzDS0lNH3rrQbEtR9CryTUh8M4GPZm9PnxP0=
 github.com/treethought/pulsesms v0.0.10-0.20210617020847-034b8d0a7a77/go.mod h1:7/9sXxltilKgADQpXsA/obzF63aSuV4M5PB01jy6zmE=
 github.com/urfave/cli v1.20.0/go.mod h1:70zkFmudgCuE/ngEzBv17Jvp/497gISqfk5gWijbERA=

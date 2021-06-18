@@ -1488,6 +1488,7 @@ func (portal *Portal) convertMatrixMessage(sender *User, evt *event.Event) (*pul
 		portal.bridge.Log.Warnfln("portal ID is not valid convoID: %s", portal.Key.PID)
 	}
 
+    id := generatePulseMessageID()
 	msg := &pulsesms.Message{
 		ConversationID: convoID,
 		From:           sender.PID,
