@@ -24,6 +24,5 @@ COPY --from=builder /build/example-config.yaml /opt/matrix-pulsesms/example-conf
 COPY --from=builder /build/docker-run.sh /docker-run.sh
 VOLUME /data
 
-# ENTRYPOINT ["/usr/bin/matrix-pulsesms"]
 
 CMD ["/docker-run.sh"]
